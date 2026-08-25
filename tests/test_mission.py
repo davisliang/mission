@@ -1893,6 +1893,9 @@ class MCPIntegrationTest(unittest.IsolatedAsyncioTestCase):
         "account_reference_add",
         "account_reference_list",
         "mission_create",
+        "mission_list",
+        "mission_get",
+        "board_snapshot",
         "mission_change_decide",
         "action_decide",
         "procedural_memory_change_list_pending",
@@ -1946,7 +1949,19 @@ class MCPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 goal="Prove the transport and privacy boundary",
                 constraints=[],
                 acceptance_criteria=["A real tool and resource call succeed"],
+                action_policy={
+                    "default": "allow",
+                    "rules": [{"action": "email.*", "effect": "require_approval"}],
+                },
                 idempotency_key="mcp-mission",
+            )["mission"]
+            delegate_mission = store.mission_create(
+                owner_agent_id=delegate["id"],
+                title="Delegate-owned mission",
+                goal="Prove owner-filtered discovery",
+                constraints=[],
+                acceptance_criteria=["Only owned missions appear when filtered"],
+                idempotency_key="mcp-delegate-mission",
             )["mission"]
             outsider_mission = store.mission_create(
                 owner_agent_id=outsider["id"],
@@ -2000,6 +2015,13 @@ class MCPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 reason="Owner-only improvement",
                 idempotency_key="mcp-owner-procedure",
             )
+            pending_action = store.action_prepare(
+                mission_id=mission["id"],
+                agent_id=owner["id"],
+                action_type="email.send",
+                payload={"to": "review@example.com", "subject": "Exact approval payload"},
+                idempotency_key="mcp-pending-action",
+            )["action_request"]
 
             with self.assertRaises(ValueError):
                 build_server(store)
@@ -2020,6 +2042,29 @@ class MCPIntegrationTest(unittest.IsolatedAsyncioTestCase):
             )
 
             async with Client(build_server(store, "control"), raise_exceptions=True) as control:
+                recovered_missions = await control.call_tool("mission_list", {})
+                self.assertFalse(recovered_missions.is_error)
+                self.assertIn(
+                    mission["id"],
+                    {value["id"] for value in recovered_missions.structured_content["result"]},
+                )
+                recovered_mission = await control.call_tool(
+                    "mission_get", {"mission_id": mission["id"]}
+                )
+                self.assertFalse(recovered_mission.is_error)
+                self.assertEqual(recovered_mission.structured_content["id"], mission["id"])
+                recovered_board = await control.call_tool(
+                    "board_snapshot", {"mission_id": mission["id"]}
+                )
+                self.assertFalse(recovered_board.is_error)
+                recovered_action = recovered_board.structured_content["live_actions"][0]
+                self.assertEqual(recovered_action["id"], pending_action["id"])
+                self.assertEqual(recovered_action["version"], pending_action["version"])
+                self.assertEqual(
+                    recovered_action["payload"],
+                    {"to": "review@example.com", "subject": "Exact approval payload"},
+                )
+
                 owner_pending = await control.call_tool(
                     "procedural_memory_change_list_pending",
                     {"agent_id": owner["id"], "mission_id": mission["id"]},
@@ -2061,6 +2106,20 @@ class MCPIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     {tool.name for tool in (await client.list_tools()).tools},
                     self.AGENT_TOOLS,
+                )
+                visible_missions = await client.call_tool("mission_list", {})
+                self.assertFalse(visible_missions.is_error)
+                self.assertEqual(
+                    {value["id"] for value in visible_missions.structured_content["result"]},
+                    {mission["id"], delegate_mission["id"]},
+                )
+                owned_missions = await client.call_tool(
+                    "mission_list", {"owner_agent_id": delegate["id"]}
+                )
+                self.assertFalse(owned_missions.is_error)
+                self.assertEqual(
+                    [value["id"] for value in owned_missions.structured_content["result"]],
+                    [delegate_mission["id"]],
                 )
                 templates = await client.list_resource_templates()
                 self.assertEqual(

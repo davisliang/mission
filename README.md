@@ -197,14 +197,16 @@ authenticated durable agent ID.
 
 - `agent_onboard`, `agent_list`
 - `account_reference_add`, `account_reference_list`
-- `mission_create`, `mission_change_decide`
+- `mission_create`, `mission_list`, `mission_get`, `board_snapshot`, `mission_change_decide`
 - `action_decide`
 - `procedural_memory_change_list_pending`
 - `agent_conversation_append`, `agent_conversation_history`
 - `conversation_append`, `audit_list`
 
-Mission creation, human decisions, authenticated conversation writes, and the complete audit stream
-remain behind the trusted control boundary.
+Mission creation, review-queue recovery, human decisions, authenticated conversation writes, and
+the complete audit stream remain behind the trusted control boundary. The read-only mission and
+board tools preserve the exact payload and record version a human must inspect before approving a
+pending external action after a restart.
 
 ### `runtime`
 

@@ -275,6 +275,23 @@ def build_server(
             """Read the append-only audit stream at the trusted control boundary."""
             return _call(store.audit_list, mission_id=mission_id, after_seq=after_seq, limit=limit)
 
+    if surface == "control":
+
+        @mcp.tool(annotations=READ)
+        def mission_list(owner_agent_id: str | None = None) -> list[dict[str, Any]]:
+            """List missions so the human-facing host can recover its review queues."""
+            return _call(store.mission_list, owner_agent_id=owner_agent_id)
+
+        @mcp.tool(annotations=READ)
+        def mission_get(mission_id: str) -> dict[str, Any]:
+            """Read an exact mission specification at the trusted control boundary."""
+            return _call(store.mission_get, mission_id=mission_id)
+
+        @mcp.tool(annotations=READ)
+        def board_snapshot(mission_id: str) -> dict[str, Any]:
+            """Recover pending changes and exact action payloads for human review."""
+            return _call(store.board_snapshot, mission_id=mission_id)
+
     if surface in {"agent", "all"}:
 
         @mcp.tool(annotations=READ)
@@ -287,9 +304,15 @@ def build_server(
         def mission_list(owner_agent_id: str | None = None) -> list[dict[str, Any]]:
             """List missions visible to this durable agent."""
             if surface == "agent":
+                missions = _call(store.mission_list_for_agent, agent_id=bound_agent_id)
                 if owner_agent_id is not None:
                     authorize_actor(owner_agent_id)
-                return _call(store.mission_list_for_agent, agent_id=bound_agent_id)
+                    return [
+                        mission
+                        for mission in missions
+                        if mission["owner_agent_id"] == owner_agent_id
+                    ]
+                return missions
             return _call(store.mission_list, owner_agent_id=owner_agent_id)
 
         @mcp.tool(annotations=READ)
