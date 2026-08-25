@@ -1101,7 +1101,7 @@ class MissionStore:
                 mission = self.mission_get(change["mission_id"])
             elif approve:
                 if change["mission_id"] is not None:
-                    self._mission_open(change["mission_id"])
+                    self._must("missions", change["mission_id"], "Mission")
                 patch = change["patch"]
                 current = self._one(
                     "SELECT * FROM procedures WHERE agent_id=? AND name=?",
@@ -1212,7 +1212,8 @@ class MissionStore:
                 (mission_id, self._now()),
             ).fetchone()[0]
             pending_changes = self.db.execute(
-                "SELECT COUNT(*) FROM mission_changes WHERE mission_id=? AND status='pending'",
+                "SELECT COUNT(*) FROM mission_changes "
+                "WHERE mission_id=? AND kind='mission' AND status='pending'",
                 (mission_id,),
             ).fetchone()[0]
             live_actions = self.db.execute(
@@ -2431,7 +2432,7 @@ class MissionStore:
                 ),
                 "pending_changes": self._all(
                     "SELECT * FROM mission_changes WHERE mission_id=? "
-                    "AND status='pending' ORDER BY created_at,id",
+                    "AND kind='mission' AND status='pending' ORDER BY created_at,id",
                     (mission_id,),
                 ),
                 "live_actions": self._all(
@@ -3078,6 +3079,34 @@ class MissionStore:
 
         return self._mutate("procedural_memory_change_propose", idempotency_key, request, operation)
 
+    def procedural_memory_change_list_pending(
+        self,
+        *,
+        agent_id: str,
+        mission_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List an agent's pending procedure proposals in a recoverable scope.
+
+        With a mission scope, the result includes both agent-global proposals and
+        proposals linked to that mission. Procedure governance is private agent
+        state and is intentionally not projected onto the shared mission board.
+        """
+        with self._lock:
+            self._must("agents", agent_id, "Agent")
+            if mission_id is None:
+                return self._all(
+                    "SELECT * FROM mission_changes WHERE kind='procedure' "
+                    "AND agent_id=? AND status='pending' ORDER BY created_at,id",
+                    (agent_id,),
+                )
+            self.mission_get_for_agent(mission_id, agent_id)
+            return self._all(
+                "SELECT * FROM mission_changes WHERE kind='procedure' "
+                "AND agent_id=? AND status='pending' "
+                "AND (mission_id IS NULL OR mission_id=?) ORDER BY created_at,id",
+                (agent_id, mission_id),
+            )
+
     def memory_search(
         self,
         *,
@@ -3085,8 +3114,9 @@ class MissionStore:
         query: str,
         mission_id: str | None = None,
         limit: int = 20,
+        offset: int = 0,
     ) -> dict[str, Any]:
-        """Search one agent's current, unexpired memory in an optional mission scope."""
+        """Search one agent's current memory with independent category paging."""
         with self._lock:
             self._must("agents", agent_id, "Agent")
             if mission_id is not None:
@@ -3101,36 +3131,96 @@ class MissionStore:
                 "VALIDATION_ERROR",
                 "limit must be positive",
             )
+            self._require(
+                isinstance(offset, int) and offset >= 0,
+                "VALIDATION_ERROR",
+                "offset must be a non-negative integer",
+            )
             size, term, now = min(limit, 100), f"%{query}%", self._now()
             if mission_id is None:
                 scope_sql, scope_values = "", []
             else:
                 scope_sql, scope_values = "AND (mission_id IS NULL OR mission_id=?)", [mission_id]
-            semantic = self._all(
+            semantic_rows = self._all(
                 "SELECT * FROM semantic_memory WHERE agent_id=? "
                 f"{scope_sql} AND (expires_at IS NULL OR "
                 "julianday(expires_at)>julianday(?)) AND (key LIKE ? OR content LIKE ? "
-                "OR provenance LIKE ?) ORDER BY updated_at DESC,id LIMIT ?",
-                [agent_id, *scope_values, now, term, term, term, size],
+                "OR provenance LIKE ?) ORDER BY updated_at DESC,id LIMIT ? OFFSET ?",
+                [agent_id, *scope_values, now, term, term, term, size + 1, offset],
             )
-            episodes = self._all(
+            episode_rows = self._all(
                 "SELECT * FROM episodes WHERE agent_id=? "
                 f"{scope_sql} AND (summary LIKE ? OR evidence_json LIKE ? OR tags_json LIKE ?) "
-                "ORDER BY occurred_at DESC,id LIMIT ?",
-                [agent_id, *scope_values, term, term, term, size],
+                "ORDER BY occurred_at DESC,id LIMIT ? OFFSET ?",
+                [agent_id, *scope_values, term, term, term, size + 1, offset],
             )
-            procedures = self._all(
+            procedure_rows = self._all(
                 "SELECT * FROM procedures WHERE agent_id=? "
-                "AND (name LIKE ? OR content LIKE ?) ORDER BY updated_at DESC,id LIMIT ?",
-                (agent_id, term, term, size),
+                "AND (name LIKE ? OR content LIKE ?) "
+                "ORDER BY updated_at DESC,id LIMIT ? OFFSET ?",
+                (agent_id, term, term, size + 1, offset),
             )
+
+            def page(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                has_more = len(rows) > size
+                values = rows[:size]
+                return values, {
+                    "offset": offset,
+                    "limit": size,
+                    "has_more": has_more,
+                    "next_offset": offset + len(values) if has_more else None,
+                }
+
+            semantic, semantic_page = page(semantic_rows)
+            episodes, episodic_page = page(episode_rows)
+            procedures, procedural_page = page(procedure_rows)
             return {
                 "semantic": semantic,
                 "episodic": episodes,
                 "procedural": procedures,
+                "pagination": {
+                    "semantic": semantic_page,
+                    "episodic": episodic_page,
+                    "procedural": procedural_page,
+                },
             }
 
     # --- Raw conversation and handoff context ----------------------
+
+    def _validate_conversation_actor(
+        self,
+        *,
+        role: str,
+        actor_id: str,
+        scoped_agent_id: str,
+    ) -> str:
+        """Bind each conversation role to its durable actor namespace."""
+        self._require(
+            role in {"user", "assistant", "tool", "system"},
+            "VALIDATION_ERROR",
+            "Invalid conversation role",
+        )
+        self._require(
+            isinstance(actor_id, str) and actor_id.strip(),
+            "VALIDATION_ERROR",
+            "actor_id is required",
+        )
+        normalized = actor_id.strip()
+        actor_agent = self._one("SELECT 1 AS present FROM agents WHERE id=?", (normalized,))
+        if role == "assistant":
+            self._require(
+                normalized == scoped_agent_id and actor_agent,
+                "FORBIDDEN",
+                "Assistant messages require the scoped durable agent identity",
+            )
+            return normalized
+        prefix = {"user": "human:", "system": "system:", "tool": "tool:"}[role]
+        self._require(
+            not actor_agent and normalized.startswith(prefix) and len(normalized) > len(prefix),
+            "FORBIDDEN",
+            f"{role.title()} messages require an {prefix} actor identity",
+        )
+        return normalized
 
     def conversation_append(
         self,
@@ -3157,14 +3247,6 @@ class MissionStore:
             mission = self._must("missions", mission_id, "Mission")
             recipient_agent_id = agent_id or mission["owner_agent_id"]
             self.mission_get_for_agent(mission_id, recipient_agent_id)
-            actor_agent = self._one("SELECT * FROM agents WHERE id=?", (actor_id,))
-            self._require(
-                role != "assistant" or actor_agent,
-                "FORBIDDEN",
-                "Assistant messages require a durable agent identity",
-            )
-            if actor_agent:
-                self.mission_get_for_agent(mission_id, actor_id)
             message_metadata = {} if metadata is None else metadata
             self._require(
                 isinstance(message_metadata, dict),
@@ -3221,17 +3303,6 @@ class MissionStore:
 
         def operation() -> dict[str, Any]:
             self._must("agents", agent_id, "Agent")
-            actor_agent = self._one("SELECT * FROM agents WHERE id=?", (actor_id,))
-            self._require(
-                not actor_agent or actor_id == agent_id,
-                "FORBIDDEN",
-                "An agent may append only to its own general conversation",
-            )
-            self._require(
-                role != "assistant" or actor_id == agent_id,
-                "FORBIDDEN",
-                "Assistant messages require the scoped durable agent identity",
-            )
             message_metadata = {} if metadata is None else metadata
             self._require(
                 isinstance(message_metadata, dict),
@@ -3264,15 +3335,10 @@ class MissionStore:
         content: str,
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
-        self._require(
-            role in {"user", "assistant", "tool", "system"},
-            "VALIDATION_ERROR",
-            "Invalid conversation role",
-        )
-        self._require(
-            isinstance(actor_id, str) and actor_id.strip(),
-            "VALIDATION_ERROR",
-            "actor_id is required",
+        normalized_actor_id = self._validate_conversation_actor(
+            role=role,
+            actor_id=actor_id,
+            scoped_agent_id=agent_id,
         )
         self._require(
             isinstance(content, str) and content.strip(),
@@ -3288,7 +3354,7 @@ class MissionStore:
                 mission_id,
                 agent_id,
                 role,
-                actor_id.strip(),
+                normalized_actor_id,
                 content,
                 self._json(metadata),
                 now,
@@ -3298,7 +3364,7 @@ class MissionStore:
         event_id = self._event(
             "conversation.appended",
             mission_id=mission_id,
-            actor_id=actor_id.strip(),
+            actor_id=normalized_actor_id,
             payload={
                 "message_id": record_id,
                 "seq": cursor,
@@ -3365,23 +3431,26 @@ class MissionStore:
         self,
         *,
         mission_id: str,
+        owner_agent_id: str,
         through_seq: int,
         summary: str,
         idempotency_key: str,
-        agent_id: str | None = None,
     ) -> dict[str, Any]:
         """Add a monotonic summary checkpoint without deleting raw messages."""
         request = {
             "mission_id": mission_id,
+            "owner_agent_id": owner_agent_id,
             "through_seq": through_seq,
             "summary": summary,
-            "agent_id": agent_id,
         }
 
         def operation() -> dict[str, Any]:
             mission = self._must("missions", mission_id, "Mission")
-            checkpoint_agent_id = agent_id or mission["owner_agent_id"]
-            self.mission_get_for_agent(mission_id, checkpoint_agent_id)
+            self._require(
+                owner_agent_id == mission["owner_agent_id"],
+                "FORBIDDEN",
+                "Only the mission owner may compact shared conversation",
+            )
             self._require(
                 isinstance(through_seq, int) and through_seq > 0,
                 "VALIDATION_ERROR",
@@ -3423,7 +3492,7 @@ class MissionStore:
                 (
                     record_id,
                     mission_id,
-                    checkpoint_agent_id,
+                    owner_agent_id,
                     through_seq,
                     summary.strip(),
                     now,
@@ -3433,7 +3502,7 @@ class MissionStore:
             event_id = self._event(
                 "conversation.compacted",
                 mission_id=mission_id,
-                actor_id=checkpoint_agent_id,
+                actor_id=owner_agent_id,
                 payload={"compaction": checkpoint},
             )
             return {"compaction": checkpoint, "event_id": event_id}
@@ -3460,6 +3529,7 @@ class MissionStore:
         *,
         agent_id: str | None = None,
         conversation_tail: int = 50,
+        memory_limit: int = 20,
     ) -> dict[str, Any]:
         """Build bounded resumption context for one participating recipient agent."""
         with self._lock:
@@ -3470,6 +3540,11 @@ class MissionStore:
                 isinstance(conversation_tail, int) and conversation_tail > 0,
                 "VALIDATION_ERROR",
                 "conversation_tail must be positive",
+            )
+            self._require(
+                isinstance(memory_limit, int) and memory_limit > 0,
+                "VALIDATION_ERROR",
+                "memory_limit must be positive",
             )
             latest_compaction = self._one(
                 "SELECT * FROM compactions WHERE mission_id=? "
@@ -3513,23 +3588,29 @@ class MissionStore:
             ]
             audit_rows = visible_events[-50:]
             board = self.board_snapshot(mission_id)
-            private_changes = [
-                change
-                for change in board["pending_changes"]
-                if change["kind"] == "procedure" and change["agent_id"] != recipient_agent_id
-            ]
-            board["pending_changes"] = [
-                change for change in board["pending_changes"] if change not in private_changes
-            ]
-            board["hidden_agent_private_pending_change_count"] = len(private_changes)
+            memory = self.memory_search(
+                agent_id=recipient_agent_id,
+                query="",
+                mission_id=mission_id,
+                limit=memory_limit,
+            )
+            memory_has_more = {
+                category: page["has_more"] for category, page in memory["pagination"].items()
+            }
+            memory_next_offset = {
+                category: page["next_offset"] for category, page in memory["pagination"].items()
+            }
             return {
                 "agent": self.agent_get(recipient_agent_id),
                 "recipient_agent_id": recipient_agent_id,
                 "mission_owner_agent_id": mission["owner_agent_id"],
                 "board": board,
-                "memory": self.memory_search(
+                "memory": memory,
+                "memory_truncated": any(memory_has_more.values()),
+                "memory_has_more": memory_has_more,
+                "memory_next_offset": memory_next_offset,
+                "pending_procedure_changes": self.procedural_memory_change_list_pending(
                     agent_id=recipient_agent_id,
-                    query="",
                     mission_id=mission_id,
                 ),
                 "latest_compaction": latest_compaction,

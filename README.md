@@ -83,23 +83,27 @@ requests alongside operational work.
 
 Semantic memory keeps one current fact per agent, optional mission scope, and key. Writes require
 provenance and an optimistic version; every complete version remains in immutable history and the
-audit stream. Expiry hides a current fact from search without erasing its history. Episodic memory
-is append-only evidence of what happened. Agent-wide procedures do not change immediately: an
-agent proposes an exact versioned change, optionally linked to a mission, and a trusted human
-approves or rejects it through the same governance path as mission changes.
+audit stream. Expiry hides a current fact from search without erasing its history. Search is paged
+independently by category and reports where to continue each truncated result. Episodic memory is
+append-only evidence of what happened. Agent-wide procedures do not change immediately: an agent
+proposes an exact versioned change, optionally linked to a mission for provenance, and a trusted
+human approves or rejects it through the same governance path as mission changes. Pending
+procedures stay private agent state; they do not appear on the shared board or block mission
+closure, and the owning agent can recover them after restart or mission closure.
 
 Conversation has two explicit scopes. Mission conversation is shared by participating agents;
-general conversation belongs to one durable agent. Every message is immutable. A compaction is an
-additive summary checkpoint through a validated message cursor, never deletion or replacement of
-the raw history. A user reply may carry `metadata.work_item_id` only for active `needs_input` work
-in the same mission.
+general conversation belongs to one durable agent. Every message is immutable. Actor namespaces
+bind `user` to `human:*`, `system` to `system:*`, and `tool` to `tool:*`; `assistant` must be the
+scoped durable agent. A compaction is an owner-only additive summary checkpoint through a validated
+message cursor, never deletion or replacement of the raw history. A human reply may carry
+`metadata.work_item_id` only for active `needs_input` work in the same mission.
 
 `mission_handoff` builds bounded resumption context for a named participating recipient. It keeps
 the recipient identity distinct from the mission owner and combines the authoritative board,
 recipient-only memory and general chat, the newest shared conversation after the latest compaction,
-and the newest shared audit events. Tail truncation flags tell the host when it must page history.
-Another agent's private semantic memory and general chat are never included in the recipient's
-handoff.
+the recipient's pending procedure proposals, and the newest shared audit events. Tail and memory
+truncation metadata tell the host when and where it must page more context. Another agent's private
+semantic memory, procedures, and general chat are never included in the recipient's handoff.
 
 ## Host scheduling boundary
 
@@ -162,7 +166,7 @@ ephemeral and is useful only for tests or experiments.
 - External actions: `action_prepare`, `action_decide`, `action_cancel`, `action_redeem`,
   `action_resolve`
 - Memory: `semantic_memory_put`, `semantic_memory_history`, `episodic_memory_append`,
-  `procedural_memory_change_propose`, `memory_search`
+  `procedural_memory_change_propose`, `procedural_memory_change_list_pending`, `memory_search`
 - Conversation: mission/general append and history, `conversation_compact`
 - Handoff: `mission_handoff`
 - Work: create, get, list, update, assign, add/remove dependency, transition, and archive
