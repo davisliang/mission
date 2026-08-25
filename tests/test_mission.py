@@ -324,6 +324,91 @@ class MissionStoreTest(unittest.TestCase):
             )["claims"][0]
             self.assertEqual(reclaimed["work_item"]["id"], item["id"])
 
+    def test_terminal_state_archive_and_reassignment_revoke_execution_leases(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            completed_item = self.create_work(store, agent, mission, "Complete claimed work")
+            completed_claim = store.ready_work_claim(
+                worker_id="runtime",
+                limit=1,
+                lease_seconds=3600,
+                idempotency_key=self.key(),
+            )["claims"][0]["claim"]
+            store.work_item_transition(
+                work_item_id=completed_item["id"],
+                actor_agent_id=agent["id"],
+                expected_version=completed_item["version"],
+                new_state="done",
+                verification_evidence=[{"summary": "Claimed work verified"}],
+                idempotency_key=self.key(),
+            )
+
+            delegate = store.agent_onboard(
+                name="Jordan",
+                role="Specialist",
+                idempotency_key=self.key(),
+            )["agent"]
+            reassigned_item = self.create_work(store, agent, mission, "Reassign claimed work")
+            reassigned_claim = store.ready_work_claim(
+                worker_id="runtime",
+                limit=1,
+                lease_seconds=3600,
+                idempotency_key=self.key(),
+            )["claims"][0]["claim"]
+            reassigned_item = store.work_item_assign(
+                work_item_id=reassigned_item["id"],
+                owner_agent_id=agent["id"],
+                assignee_agent_id=delegate["id"],
+                expected_version=reassigned_item["version"],
+                idempotency_key=self.key(),
+            )["work_item"]
+            store.work_item_archive(
+                work_item_id=reassigned_item["id"],
+                owner_agent_id=agent["id"],
+                expected_version=reassigned_item["version"],
+                reason="The delegated work is no longer needed",
+                idempotency_key=self.key(),
+            )
+
+            archived_item = self.create_work(store, agent, mission, "Archive claimed work")
+            archived_claim = store.ready_work_claim(
+                worker_id="runtime",
+                limit=1,
+                lease_seconds=3600,
+                idempotency_key=self.key(),
+            )["claims"][0]["claim"]
+            store.work_item_archive(
+                work_item_id=archived_item["id"],
+                owner_agent_id=agent["id"],
+                expected_version=archived_item["version"],
+                reason="The user cancelled this work",
+                idempotency_key=self.key(),
+            )
+
+            for claim in (completed_claim, reassigned_claim, archived_claim):
+                status = store.db.execute(
+                    "SELECT status FROM execution_claims WHERE id=?", (claim["id"],)
+                ).fetchone()["status"]
+                self.assertEqual(status, "released")
+            self.assertEqual(store.board_snapshot(mission["id"])["execution_claims"], [])
+
+            closed = store.mission_close(
+                mission_id=mission["id"],
+                owner_agent_id=agent["id"],
+                expected_version=mission["version"],
+                closure_evidence=[{"summary": "All remaining work was verified or cancelled"}],
+                idempotency_key=self.key(),
+            )["mission"]
+            self.assertEqual(closed["status"], "closed")
+            self.assert_domain_error(
+                "MISSION_CLOSED",
+                store.ready_work_release,
+                claim_id=completed_claim["id"],
+                worker_id="runtime",
+                expected_version=completed_claim["version"],
+                idempotency_key=self.key(),
+            )
+
     def test_dependency_scope_initial_state_and_cycle_validation(self) -> None:
         store, agent, mission = self.context()
         with store:

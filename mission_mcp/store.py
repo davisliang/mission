@@ -761,10 +761,16 @@ class MissionStore:
                 "WHERE mission_id=? AND status IN ('scheduled','claimed')",
                 (mission_id,),
             ).fetchone()[0]
+            live_claims = self.db.execute(
+                "SELECT COUNT(*) FROM execution_claims "
+                "WHERE mission_id=? AND status='claimed' "
+                "AND julianday(lease_expires_at)>julianday(?)",
+                (mission_id, self._now()),
+            ).fetchone()[0]
             self._require(
-                not unfinished and not live_wakes,
+                not unfinished and not live_wakes and not live_claims,
                 "PRECONDITION_FAILED",
-                "Mission still has active work or wakeups",
+                "Mission still has active work, wakeups, or execution leases",
             )
             self._validate_evidence(closure_evidence, "mission closure")
             now = self._now()
@@ -867,6 +873,36 @@ class MissionStore:
             (self._now(), work_item_id),
         )
 
+    def _revoke_execution_claims(
+        self,
+        work_item_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+    ) -> list[str]:
+        """Revoke runtime authority when a card stops being actionable or changes hands."""
+        claims = self._all(
+            "SELECT * FROM execution_claims WHERE work_item_id=? AND status='claimed'",
+            (work_item_id,),
+        )
+        now = self._now()
+        for claim in claims:
+            self.db.execute(
+                "UPDATE execution_claims SET status='released',version=version+1,updated_at=? "
+                "WHERE id=?",
+                (now, claim["id"]),
+            )
+            self._event(
+                "work.execution_revoked",
+                mission_id=claim["mission_id"],
+                actor_id=actor_id,
+                payload={
+                    "claim": self._must("execution_claims", claim["id"], "Execution claim"),
+                    "reason": reason,
+                },
+            )
+        return [claim["id"] for claim in claims]
+
     def _schedule_wakeup(self, item: dict[str, Any], due_at: str, condition: str | None) -> str:
         wakeup_id, now = self._id(), self._now()
         self.db.execute(
@@ -899,7 +935,7 @@ class MissionStore:
                 unblocked.append(dependent_id)
         return unblocked
 
-    def _reblock_dependents(self, dependency_id: str) -> list[str]:
+    def _reblock_dependents(self, dependency_id: str, *, actor_id: str) -> list[str]:
         """Recursively invalidate every active downstream card, including Done cards."""
         pending, seen, reblocked = [dependency_id], {dependency_id}, []
         while pending:
@@ -921,6 +957,11 @@ class MissionStore:
                     continue
                 if dependent["state"] != "blocked":
                     self._cancel_wakes(dependent_id)
+                    self._revoke_execution_claims(
+                        dependent_id,
+                        actor_id=actor_id,
+                        reason="An upstream dependency reopened",
+                    )
                     self.db.execute(
                         "UPDATE work_items SET state='blocked',wait_condition=NULL,"
                         "next_check_at=NULL,input_request=NULL,verification_evidence_json=NULL,"
@@ -1186,6 +1227,12 @@ class MissionStore:
             )
             self._require(not item["archived"], "WORK_ARCHIVED", "Archived work is immutable")
             self._must("agents", assignee_agent_id, "Assignee")
+            if assignee_agent_id != item["assignee_agent_id"]:
+                self._revoke_execution_claims(
+                    work_item_id,
+                    actor_id=owner_agent_id,
+                    reason="The work item was reassigned",
+                )
             self.db.execute(
                 "UPDATE work_items SET assignee_agent_id=?,version=version+1,updated_at=? WHERE id=?",
                 (assignee_agent_id, self._now(), work_item_id),
@@ -1237,6 +1284,11 @@ class MissionStore:
             was_done = item["state"] == "done"
             if became_blocked:
                 self._cancel_wakes(work_item_id)
+                self._revoke_execution_claims(
+                    work_item_id,
+                    actor_id=actor_agent_id,
+                    reason="An open dependency was added",
+                )
                 self.db.execute(
                     "UPDATE work_items SET state='blocked',wait_condition=NULL,next_check_at=NULL,"
                     "input_request=NULL,verification_evidence_json=NULL,version=version+1,"
@@ -1249,7 +1301,9 @@ class MissionStore:
                     (self._now(), work_item_id),
                 )
             reblocked = (
-                self._reblock_dependents(work_item_id) if was_done and became_blocked else []
+                self._reblock_dependents(work_item_id, actor_id=actor_agent_id)
+                if was_done and became_blocked
+                else []
             )
             updated = self.work_item_get(work_item_id)
             revision = self._bump_board(item["mission_id"])
@@ -1395,6 +1449,12 @@ class MissionStore:
                     verification_evidence or [], "completion", code="INVALID_STATE"
                 )
             self._cancel_wakes(work_item_id)
+            if new_state != "doing":
+                self._revoke_execution_claims(
+                    work_item_id,
+                    actor_id=actor_agent_id,
+                    reason=f"The work item moved to {new_state}",
+                )
             self.db.execute(
                 "UPDATE work_items SET state=?,wait_condition=?,next_check_at=?,input_request=?,"
                 "verification_evidence_json=?,version=version+1,updated_at=? WHERE id=?",
@@ -1412,7 +1472,7 @@ class MissionStore:
             wakeup_ids = [self._schedule_wakeup(updated, due, wait_condition)] if due else []
             unblocked = self._unblock_dependents(work_item_id) if new_state == "done" else []
             reblocked = (
-                self._reblock_dependents(work_item_id)
+                self._reblock_dependents(work_item_id, actor_id=actor_agent_id)
                 if item["state"] == "done" and new_state != "done"
                 else []
             )
@@ -1487,6 +1547,11 @@ class MissionStore:
                 active_dependent_count=active_dependents,
             )
             self._cancel_wakes(work_item_id)
+            self._revoke_execution_claims(
+                work_item_id,
+                actor_id=owner_agent_id,
+                reason="The work item was archived",
+            )
             self.db.execute(
                 "UPDATE work_items SET archived=1,archive_reason=?,version=version+1,"
                 "updated_at=? WHERE id=?",
@@ -1640,6 +1705,7 @@ class MissionStore:
 
         def operation() -> dict[str, Any]:
             claim = self._must("execution_claims", claim_id, "Execution claim")
+            self._mission_open(claim["mission_id"])
             self._version(claim, expected_version)
             self._require(
                 claim["status"] == "claimed" and claim["worker_id"] == worker_id,
