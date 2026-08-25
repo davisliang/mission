@@ -1,42 +1,65 @@
-# Mission MCP: storage foundation
+# Mission MCP: durable board and runtime foundation
 
-Long-running assistant work should not disappear when a chat ends or a model changes. This first
-project slice establishes a durable SQLite record for the agent identity and the mission it owns.
-Models and providers are deliberately absent from that identity: a later executor can resume the
-same durable agent and mission.
+Long-running assistant work should not disappear when a chat ends or a model changes. This
+snapshot keeps the durable agent, mission, and work board in SQLite so another model execution can
+resume the same plan. Current board rows drive execution; append-only events retain what changed.
 
 ## Included in this snapshot
 
-- Durable agent onboarding, lookup, and listing
-- Non-secret account references and scopes
-- Mission creation, lookup, and listing with exactly one owner
-- Validated, ordered action-policy rules inherited from onboarding
-- Atomic SQLite transactions guarded for multi-threaded callers
-- Idempotency keys bound to the exact mutation request
-- Append-only audit events for every successful mutation
+- Durable agents, non-secret account references, and one-owner missions
+- A five-state work board with one assigned writer per card
+- Same-mission, acyclic dependencies with automatic unblock and recursive reblock
+- Evidence-backed completion and explicit, evidence-backed mission closure
+- Reasoned archiving that preserves history and protects active dependents
+- Durable leases for actionable work and timed or conditional wakeups
+- Atomic transactions, optimistic versions, and request-bound idempotency
+- Validated action policy inherited from onboarding, ready for a later enforcement layer
 
-This is the domain-store foundation only. It does **not** yet include an MCP transport, board work
-items, memory, approvals, wake scheduling, external-action permits, or a model host. Those layers
-can build on these storage guarantees without making a model session the source of truth.
+This remains a transport-independent domain store. It does **not** yet include an MCP server,
+conversation or memory management, human approval flows, external-action permits, connectors, or a
+model host.
 
-## Core rules
+## Mission and board model
 
-An agent is a durable identity and may eventually own many missions. Each mission has one owning
-agent and records its goal, constraints, acceptance criteria, action policy, lifecycle status,
-and optimistic version.
+An agent is a durable identity that may own many missions. Each mission has one owner. The owner
+creates, delegates, and archives work; the assigned agent is the card's single writer. Every card
+mutation supplies `expected_version`, so a stale execution cannot silently overwrite newer state.
 
-Mutating methods require an `idempotency_key`. Repeating the same request with the same key returns
-the original response; reusing that key for different arguments raises `IDEMPOTENCY_CONFLICT`.
-Current rows are operational state, while immutable events retain the history of successful
-changes.
+The five states belong to work items, not missions:
 
-Action policy allows by default and supports ordered exact-name or glob rules with three effects:
-`allow`, `require_approval`, and `deny`. This snapshot validates and stores policy; enforcement
-arrives with the external-action layer.
+| State | Meaning |
+| --- | --- |
+| `doing` | Actionable now and eligible for an execution lease. |
+| `waiting` | Check again at `next_check_at`, optionally for a named condition. |
+| `blocked` | One or more work-item dependencies are still open. |
+| `needs_input` | A concrete human question must be answered. |
+| `done` | Complete, with retained verification evidence. |
 
-Account references are identifiers, not credentials. Metadata with secret-shaped fields such as
-passwords, API keys, tokens, private keys, or cookies is rejected. Do not place credential values
-in account identifiers, mission text, or other SQLite fields.
+Dependencies must stay within one mission and form a directed acyclic graph. Finishing the last
+open prerequisite moves a blocked card to `doing`. Reopening a completed prerequisite recursively
+reblocks every active downstream card, including cards that were already `done`; their historical
+completion evidence remains in the event stream.
+
+Archiving is cancellation from the active plan, not a sixth state. It requires a reason, never
+deletes the card, and is rejected while another active card depends on it. The owner explicitly
+closes a mission only after every non-archived card is `done`, no wakeup remains live, and the
+overall goal and acceptance criteria have concrete closure evidence.
+
+Every mutation also requires an `idempotency_key`. Repeating the exact request returns the original
+response; reusing that key for different arguments raises `IDEMPOTENCY_CONFLICT`.
+
+## Host scheduling boundary
+
+SQLite can preserve durable scheduling intent, but it cannot start a model or keep a worker
+process alive. A host or scheduler should:
+
+1. Call `ready_work_claim` to lease `doing` cards and resume their assigned agents.
+2. Call `wakeup_claim_due` to lease due `waiting` checks.
+3. Start the model with the authoritative mission and `board_snapshot` state.
+4. Release the execution lease after the model turn, or resolve the wake as ready or rescheduled.
+
+Leases prevent duplicate dispatch while allowing another worker to recover after expiry. This
+store never sends email, watches an inbox, or executes another connector itself.
 
 ## Install and use
 
@@ -64,6 +87,12 @@ with MissionStore("mission.db") as store:
         acceptance_criteria=["Venue and agenda are confirmed"],
         idempotency_key="create-retreat-mission",
     )["mission"]
+    store.work_item_create(
+        mission_id=mission["id"],
+        actor_agent_id=agent["id"],
+        title="Book the venue",
+        idempotency_key="create-venue-work",
+    )
 ```
 
 Use a durable filesystem path in real use. The default `:memory:` database is intentionally
@@ -73,11 +102,15 @@ ephemeral and is useful only for tests or experiments.
 
 - Agents: `agent_onboard`, `agent_get`, `agent_list`
 - Account references: `account_reference_add`, `account_reference_list`
-- Missions: `mission_create`, `mission_get`, `mission_list`
+- Missions: `mission_create`, `mission_get`, `mission_list`, participant reads, `mission_close`
+- Work: create, get, list, update, assign, add/remove dependency, transition, and archive
+- Board and audit: `board_snapshot`, `audit_list`
+- Runtime: `ready_work_claim`, `ready_work_release`, `wakeup_claim_due`, `wakeup_resolve`
 - Lifecycle: `close`, plus context-manager support
 
 The store assumes one trusted workspace. Authentication, caller-specific tool surfaces, and tenant
-isolation are outside this snapshot.
+isolation are outside this snapshot. Account references are identifiers, not credentials;
+secret-shaped metadata fields are rejected.
 
 ## Checks
 
