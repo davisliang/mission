@@ -56,15 +56,22 @@ class MissionStoreTest(unittest.TestCase):
             self.assertEqual(reference["account_ref"], "davis@example.com")
             self.assertEqual(reference["scopes"], ["mail.send"])
 
-            with self.assertRaises(DomainError) as caught:
-                store.account_reference_add(
-                    agent_id=agent["id"],
-                    service="gmail",
-                    account_ref="unsafe-reference",
-                    metadata={"oauth": {"api_token": "must-not-be-stored"}},
-                    idempotency_key="unsafe-account",
-                )
-            self.assertEqual(caught.exception.code, "SECRET_REJECTED")
+            unsafe_metadata = [
+                {"oauth": {"api_token": "must-not-be-stored"}},
+                {"secret_key": "must-not-be-stored"},
+                {"aws_secret_access_key": "must-not-be-stored"},
+                {"access_key_id": "must-not-be-stored"},
+            ]
+            for index, metadata in enumerate(unsafe_metadata):
+                with self.subTest(metadata=metadata), self.assertRaises(DomainError) as caught:
+                    store.account_reference_add(
+                        agent_id=agent["id"],
+                        service="gmail",
+                        account_ref=f"unsafe-reference-{index}",
+                        metadata=metadata,
+                        idempotency_key=f"unsafe-account-{index}",
+                    )
+                self.assertEqual(caught.exception.code, "SECRET_REJECTED")
             self.assertEqual(len(store.account_reference_list(agent["id"])), 1)
 
     def test_mission_inherits_a_validated_onboarding_action_policy(self) -> None:

@@ -39,6 +39,9 @@ SECRET_KEY_SUFFIXES = {
     "privatekey",
     "secret",
     "sessioncookie",
+    "accesskeyid",
+    "secretaccesskey",
+    "secretkey",
     "token",
 }
 
