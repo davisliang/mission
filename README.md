@@ -55,8 +55,9 @@ response; reusing that key for different arguments raises `IDEMPOTENCY_CONFLICT`
 Mission title, goal, constraints, acceptance criteria, and action policy cannot be edited directly.
 The owner proposes an exact patch against the current mission version; a trusted human caller then
 approves or rejects it. Approval fails if the mission changed while the proposal was waiting. Any
-approved mission-specification change supersedes every unredeemed pending or approved action
-permit, ensuring old authority cannot survive a changed objective or policy.
+approved mission-specification change supersedes every pending or approved action request, ensuring
+old authority cannot survive a changed objective or policy. A change cannot be approved while a
+connector action is already in flight.
 
 Action policy has a default effect and ordered exact-name or glob rules. The first matching rule
 wins. `action_prepare` is owner-only and stores the exact payload, its hash, and the policy hash:
@@ -65,10 +66,14 @@ wins. `action_prepare` is owner-only and stores the exact payload, its hash, and
 - `require_approval` creates a pending request for a trusted human decision.
 - `deny` records a denied request and creates no usable permit.
 
-The owner may cancel a pending or approved request with a retained reason. A trusted runtime gateway
-can redeem an approved permit exactly once, with optimistic-version and current-policy checks, and
-receives only the exact stored payload. Preparing or redeeming a permit never executes a connector.
-`board_snapshot` exposes pending mission changes and live action requests alongside operational work.
+The owner may cancel a pending or approved request with a retained reason. `action_redeem` gives a
+trusted gateway a time-limited execution claim and the exact stored payload. Its stable
+`execution_key` must be used as the downstream connector's idempotency key. The gateway then calls
+`action_resolve` with concrete success or failure evidence. An expired claim may be recovered, but
+always uses the same execution key. Mission changes and closure wait for in-flight actions, and a
+resolved, superseded, or closed action can never replay its payload. Preparing or claiming an action
+never executes a connector itself. `board_snapshot` exposes pending mission changes and live action
+requests alongside operational work.
 
 ## Host scheduling boundary
 
@@ -79,7 +84,8 @@ process alive. A host or scheduler should:
 2. Call `wakeup_claim_due` to lease due `waiting` checks.
 3. Start the model with the authoritative mission and `board_snapshot` state.
 4. Release the execution lease after the model turn, or resolve the wake as ready or rescheduled.
-5. Send an approved `action_redeem` payload to the appropriate connector gateway exactly once.
+5. Claim an approved action, execute it with its `execution_key`, and record the outcome with
+   `action_resolve`.
 
 Leases prevent duplicate dispatch while allowing another worker to recover after expiry. This
 store never sends email, watches an inbox, or executes another connector itself.
@@ -127,7 +133,8 @@ ephemeral and is useful only for tests or experiments.
 - Account references: `account_reference_add`, `account_reference_list`
 - Missions: `mission_create`, `mission_get`, `mission_list`, participant reads, `mission_close`
 - Governance: `mission_change_propose`, `mission_change_decide`
-- External actions: `action_prepare`, `action_decide`, `action_cancel`, `action_redeem`
+- External actions: `action_prepare`, `action_decide`, `action_cancel`, `action_redeem`,
+  `action_resolve`
 - Work: create, get, list, update, assign, add/remove dependency, transition, and archive
 - Board and audit: `board_snapshot`, `audit_list`
 - Runtime: `ready_work_claim`, `ready_work_release`, `wakeup_claim_due`, `wakeup_resolve`
@@ -135,8 +142,8 @@ ephemeral and is useful only for tests or experiments.
 
 The store assumes one trusted workspace. Authentication, caller-specific tool surfaces, and tenant
 isolation are outside this snapshot. A host must expose human-decision methods only through an
-authenticated human surface and `action_redeem` only to a trusted connector gateway. Account
-references are identifiers, not credentials; secret-shaped metadata fields are rejected.
+authenticated human surface and action claim/resolution only to a trusted connector gateway.
+Account references are identifiers, not credentials; secret-shaped metadata fields are rejected.
 
 ## Checks
 

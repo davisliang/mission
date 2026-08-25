@@ -32,6 +32,7 @@ JSON_COLUMNS = {
     "verification_evidence_json",
     "payload_json",
     "patch_json",
+    "outcome_evidence_json",
 }
 SECRET_KEY_SUFFIXES = {
     "apikey",
@@ -172,6 +173,8 @@ class MissionStore:
         key: str,
         request: dict[str, Any],
         operation: Callable[[], dict[str, Any]],
+        *,
+        replay_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Atomically bind an idempotency key to one tool and exact request."""
         self._require(
@@ -190,6 +193,8 @@ class MissionStore:
                     "IDEMPOTENCY_CONFLICT",
                     "idempotency_key was already used for a different request",
                 )
+                if replay_guard:
+                    replay_guard()
                 return json.loads(prior["response_json"])
             try:
                 response = operation()
@@ -429,12 +434,16 @@ class MissionStore:
                     CHECK(effect IN ('allow','require_approval','deny')),
                   status TEXT NOT NULL
                     CHECK(status IN ('pending','approved','denied','cancelled',
-                      'redeemed','superseded')),
+                      'executing','completed','failed','superseded')),
                   version INTEGER NOT NULL DEFAULT 1,
                   decided_by TEXT,
                   decision_reason TEXT,
                   decided_at TEXT,
+                  gateway_id TEXT,
+                  execution_lease_expires_at TEXT,
+                  outcome_evidence_json TEXT,
                   redeemed_at TEXT,
+                  completed_at TEXT,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
@@ -895,6 +904,17 @@ class MissionStore:
             if approve:
                 mission = self._mission_open(change["mission_id"])
                 self._version(mission, change["expected_mission_version"])
+                executing_actions = self.db.execute(
+                    "SELECT COUNT(*) FROM action_requests "
+                    "WHERE mission_id=? AND status='executing'",
+                    (change["mission_id"],),
+                ).fetchone()[0]
+                self._require(
+                    not executing_actions,
+                    "PRECONDITION_FAILED",
+                    "Resolve in-flight external actions before changing the mission",
+                    executing_action_count=executing_actions,
+                )
                 assignments: list[str] = []
                 values: list[Any] = []
                 columns = {
@@ -1003,7 +1023,7 @@ class MissionStore:
             ).fetchone()[0]
             live_actions = self.db.execute(
                 "SELECT COUNT(*) FROM action_requests "
-                "WHERE mission_id=? AND status IN ('pending','approved')",
+                "WHERE mission_id=? AND status IN ('pending','approved','executing')",
                 (mission_id,),
             ).fetchone()[0]
             self._require(
@@ -1251,27 +1271,17 @@ class MissionStore:
         gateway_id: str,
         expected_version: int,
         idempotency_key: str,
+        lease_seconds: int = 300,
     ) -> dict[str, Any]:
-        """Consume an approved permit once and return its exact stored payload."""
+        """Lease one approved action to a gateway and return its exact stored payload."""
         request = {
             "action_request_id": action_request_id,
             "gateway_id": gateway_id,
             "expected_version": expected_version,
+            "lease_seconds": lease_seconds,
         }
 
-        def operation() -> dict[str, Any]:
-            self._require(
-                isinstance(gateway_id, str) and gateway_id.strip(),
-                "VALIDATION_ERROR",
-                "gateway_id is required",
-            )
-            action = self._must("action_requests", action_request_id, "Action request")
-            self._version(action, expected_version)
-            self._require(
-                action["status"] == "approved",
-                "PRECONDITION_FAILED",
-                "Action permit is not approved or was already consumed",
-            )
+        def validate_policy_and_payload(action: dict[str, Any]) -> dict[str, Any]:
             mission = self._mission_open(action["mission_id"])
             policy_hash = sha256(self._json(mission["action_policy"]).encode()).hexdigest()
             self._require(
@@ -1285,34 +1295,145 @@ class MissionStore:
                 "PRECONDITION_FAILED",
                 "Stored action payload no longer matches its permit",
             )
-            now = self._now()
-            self.db.execute(
-                "UPDATE action_requests SET status='redeemed',version=version+1,"
-                "redeemed_at=?,updated_at=? WHERE id=?",
-                (now, now, action_request_id),
+            return mission
+
+        def replay_guard() -> None:
+            """Never replay a bearer payload after its execution claim stops being valid."""
+            action = self._must("action_requests", action_request_id, "Action request")
+            validate_policy_and_payload(action)
+            self._require(
+                action["status"] == "executing" and action["gateway_id"] == gateway_id.strip(),
+                "PRECONDITION_FAILED",
+                "Action execution claim is no longer active for this gateway",
             )
+            self._require(
+                self._parse_time(action["execution_lease_expires_at"], "execution_lease_expires_at")
+                > self._parse_time(self._now(), "clock"),
+                "LEASE_CONFLICT",
+                "Action execution lease expired",
+            )
+
+        def operation() -> dict[str, Any]:
+            self._require(
+                isinstance(gateway_id, str) and gateway_id.strip(),
+                "VALIDATION_ERROR",
+                "gateway_id is required",
+            )
+            self._require(
+                isinstance(lease_seconds, int)
+                and not isinstance(lease_seconds, bool)
+                and lease_seconds > 0,
+                "VALIDATION_ERROR",
+                "lease_seconds must be a positive integer",
+            )
+            action = self._must("action_requests", action_request_id, "Action request")
+            self._version(action, expected_version)
+            now = self._now()
+            reclaiming = action["status"] == "executing" and self._parse_time(
+                action["execution_lease_expires_at"], "execution_lease_expires_at"
+            ) <= self._parse_time(now, "clock")
+            self._require(
+                action["status"] == "approved" or reclaiming,
+                "PRECONDITION_FAILED",
+                "Action permit is neither approved nor available for lease recovery",
+            )
+            validate_policy_and_payload(action)
+            lease_expires_at = self._lease_until(lease_seconds)
+            self.db.execute(
+                "UPDATE action_requests SET status='executing',version=version+1,gateway_id=?,"
+                "execution_lease_expires_at=?,redeemed_at=COALESCE(redeemed_at,?),updated_at=? "
+                "WHERE id=?",
+                (gateway_id.strip(), lease_expires_at, now, now, action_request_id),
+            )
+            executing = self._must("action_requests", action_request_id, "Action request")
             event_id = self._event(
-                "action.redeemed",
+                "action.execution_claimed",
                 mission_id=action["mission_id"],
                 actor_id=gateway_id.strip(),
                 payload={
                     "action_request_id": action_request_id,
                     "payload_hash": action["payload_hash"],
+                    "lease_expires_at": lease_expires_at,
+                    "reclaimed": reclaiming,
                 },
             )
             return {
                 "permit": {
                     "id": action_request_id,
+                    "execution_key": action_request_id,
                     "mission_id": action["mission_id"],
                     "agent_id": action["agent_id"],
                     "action_type": action["action_type"],
                     "payload": action["payload"],
                     "payload_hash": action["payload_hash"],
+                    "lease_expires_at": lease_expires_at,
                 },
+                "action_request": executing,
                 "event_id": event_id,
             }
 
-        return self._mutate("action_redeem", idempotency_key, request, operation)
+        return self._mutate(
+            "action_redeem",
+            idempotency_key,
+            request,
+            operation,
+            replay_guard=replay_guard,
+        )
+
+    def action_resolve(
+        self,
+        *,
+        action_request_id: str,
+        gateway_id: str,
+        expected_version: int,
+        success: bool,
+        outcome_evidence: list[dict[str, Any]],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Record the connector outcome and retire one in-flight execution claim."""
+        request = {
+            "action_request_id": action_request_id,
+            "gateway_id": gateway_id,
+            "expected_version": expected_version,
+            "success": success,
+            "outcome_evidence": outcome_evidence,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._require(
+                isinstance(gateway_id, str) and gateway_id.strip(),
+                "VALIDATION_ERROR",
+                "gateway_id is required",
+            )
+            self._require(isinstance(success, bool), "VALIDATION_ERROR", "success must be boolean")
+            self._validate_evidence(outcome_evidence, "action outcome")
+            action = self._must("action_requests", action_request_id, "Action request")
+            self._mission_open(action["mission_id"])
+            self._version(action, expected_version)
+            self._require(
+                action["status"] == "executing" and action["gateway_id"] == gateway_id.strip(),
+                "LEASE_CONFLICT",
+                "Gateway does not own this action execution claim",
+            )
+            status, now = ("completed" if success else "failed"), self._now()
+            self.db.execute(
+                "UPDATE action_requests SET status=?,version=version+1,"
+                "outcome_evidence_json=?,completed_at=?,updated_at=? WHERE id=?",
+                (status, self._json(outcome_evidence), now, now, action_request_id),
+            )
+            resolved = self._must("action_requests", action_request_id, "Action request")
+            event_id = self._event(
+                f"action.{status}",
+                mission_id=action["mission_id"],
+                actor_id=gateway_id.strip(),
+                payload={
+                    "action_request": resolved,
+                    "outcome_evidence": outcome_evidence,
+                },
+            )
+            return {"action_request": resolved, "event_id": event_id}
+
+        return self._mutate("action_resolve", idempotency_key, request, operation)
 
     def audit_list(
         self,
@@ -2116,7 +2237,7 @@ class MissionStore:
                 ),
                 "live_actions": self._all(
                     "SELECT * FROM action_requests WHERE mission_id=? "
-                    "AND status IN ('pending','approved') ORDER BY created_at,id",
+                    "AND status IN ('pending','approved','executing') ORDER BY created_at,id",
                     (mission_id,),
                 ),
                 "execution_claims": self._all(

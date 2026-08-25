@@ -760,7 +760,7 @@ class MissionStoreTest(unittest.TestCase):
                 idempotency_key=self.key(),
             )
 
-    def test_action_approval_and_one_time_idempotent_redemption(self) -> None:
+    def test_action_approval_and_idempotent_execution_resolution(self) -> None:
         store, agent, _ = self.context()
         with store:
             protected = store.mission_create(
@@ -812,13 +812,15 @@ class MissionStoreTest(unittest.TestCase):
                 idempotency_key=self.key(),
             )["action_request"]
             redeem_key = self.key()
-            redeemed = store.action_redeem(
+            claimed = store.action_redeem(
                 action_request_id=action["id"],
                 gateway_id="gateway:email",
                 expected_version=approved["version"],
                 idempotency_key=redeem_key,
             )
-            self.assertEqual(redeemed["permit"]["payload"], payload)
+            self.assertEqual(claimed["permit"]["payload"], payload)
+            self.assertEqual(claimed["permit"]["execution_key"], action["id"])
+            self.assertEqual(claimed["action_request"]["status"], "executing")
             self.assertEqual(
                 store.action_redeem(
                     action_request_id=action["id"],
@@ -826,7 +828,7 @@ class MissionStoreTest(unittest.TestCase):
                     expected_version=approved["version"],
                     idempotency_key=redeem_key,
                 ),
-                redeemed,
+                claimed,
             )
             self.assert_domain_error(
                 "PRECONDITION_FAILED",
@@ -835,6 +837,27 @@ class MissionStoreTest(unittest.TestCase):
                 gateway_id="gateway:email",
                 expected_version=approved["version"] + 1,
                 idempotency_key=self.key(),
+            )
+            resolved = store.action_resolve(
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=claimed["action_request"]["version"],
+                success=True,
+                outcome_evidence=[{"connector_message_id": "email-123"}],
+                idempotency_key=self.key(),
+            )["action_request"]
+            self.assertEqual(resolved["status"], "completed")
+            self.assertEqual(
+                resolved["outcome_evidence"],
+                [{"connector_message_id": "email-123"}],
+            )
+            self.assert_domain_error(
+                "PRECONDITION_FAILED",
+                store.action_redeem,
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=approved["version"],
+                idempotency_key=redeem_key,
             )
 
     def test_owner_cancels_pending_and_approved_actions_before_closure(self) -> None:
@@ -962,6 +985,88 @@ class MissionStoreTest(unittest.TestCase):
             snapshot = store.board_snapshot(mission["id"])
             self.assertEqual(snapshot["pending_changes"], [])
             self.assertEqual(snapshot["live_actions"], [])
+
+    def test_in_flight_action_blocks_change_and_closure_without_replay(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            action = store.action_prepare(
+                mission_id=mission["id"],
+                agent_id=agent["id"],
+                action_type="email.send",
+                payload={"to": "guest@example.com", "body": "Hello"},
+                idempotency_key=self.key(),
+            )["action_request"]
+            redeem_key = self.key()
+            claimed = store.action_redeem(
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=action["version"],
+                idempotency_key=redeem_key,
+            )
+            change = store.mission_change_propose(
+                mission_id=mission["id"],
+                proposed_by=agent["id"],
+                expected_version=mission["version"],
+                patch={
+                    "action_policy": {
+                        "default": "allow",
+                        "rules": [{"action": "email.*", "effect": "deny"}],
+                    }
+                },
+                reason="Pause outbound email",
+                idempotency_key=self.key(),
+            )["change"]
+            self.assert_domain_error(
+                "PRECONDITION_FAILED",
+                store.mission_change_decide,
+                change_id=change["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Pause approved",
+                idempotency_key=self.key(),
+            )
+            self.assert_domain_error(
+                "PRECONDITION_FAILED",
+                store.mission_close,
+                mission_id=mission["id"],
+                owner_agent_id=agent["id"],
+                expected_version=mission["version"],
+                closure_evidence=[{"summary": "Mission checked"}],
+                idempotency_key=self.key(),
+            )
+
+            failed = store.action_resolve(
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=claimed["action_request"]["version"],
+                success=False,
+                outcome_evidence=[{"summary": "Connector rejected the request"}],
+                idempotency_key=self.key(),
+            )["action_request"]
+            self.assertEqual(failed["status"], "failed")
+            changed = store.mission_change_decide(
+                change_id=change["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Pause approved",
+                idempotency_key=self.key(),
+            )["mission"]
+            closed = store.mission_close(
+                mission_id=mission["id"],
+                owner_agent_id=agent["id"],
+                expected_version=changed["version"],
+                closure_evidence=[{"summary": "Mission checked"}],
+                idempotency_key=self.key(),
+            )["mission"]
+            self.assertEqual(closed["status"], "closed")
+            self.assert_domain_error(
+                "MISSION_CLOSED",
+                store.action_redeem,
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=action["version"],
+                idempotency_key=redeem_key,
+            )
 
 
 if __name__ == "__main__":
