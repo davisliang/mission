@@ -1123,6 +1123,445 @@ class MissionStoreTest(unittest.TestCase):
                 idempotency_key=redeem_key,
             )
 
+    def test_semantic_memory_retains_versions_provenance_and_expiry(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            created = store.semantic_memory_put(
+                agent_id=agent["id"],
+                actor_agent_id=agent["id"],
+                mission_id=mission["id"],
+                key="venue.preference",
+                content="Natural light",
+                provenance="User said this in chat",
+                expected_version=0,
+                idempotency_key=self.key(),
+            )["memory"]
+            updated = store.semantic_memory_put(
+                agent_id=agent["id"],
+                actor_agent_id=agent["id"],
+                mission_id=mission["id"],
+                key="venue.preference",
+                content="Natural light and step-free access",
+                provenance="User clarified in chat",
+                expected_version=created["version"],
+                idempotency_key=self.key(),
+            )["memory"]
+            self.assertEqual((created["version"], updated["version"]), (1, 2))
+            self.assertEqual(updated["provenance"], "User clarified in chat")
+            self.assert_domain_error(
+                "VERSION_CONFLICT",
+                store.semantic_memory_put,
+                agent_id=agent["id"],
+                actor_agent_id=agent["id"],
+                mission_id=mission["id"],
+                key="venue.preference",
+                content="Stale overwrite",
+                provenance="Stale source",
+                expected_version=created["version"],
+                idempotency_key=self.key(),
+            )
+            versions = store.semantic_memory_history(
+                agent_id=agent["id"],
+                mission_id=mission["id"],
+                key="venue.preference",
+            )
+            self.assertEqual(
+                [(memory["version"], memory["content"]) for memory in versions],
+                [
+                    (1, "Natural light"),
+                    (2, "Natural light and step-free access"),
+                ],
+            )
+            audit_versions = [
+                event["payload"]["memory"]
+                for event in store.audit_list(mission["id"])
+                if event["type"] == "memory.semantic_put"
+                and event["payload"]["memory"]["key"] == "venue.preference"
+            ]
+            self.assertEqual(audit_versions, versions)
+
+            expiry = (self.clock.value + timedelta(hours=1)).isoformat()
+            expiring = store.semantic_memory_put(
+                agent_id=agent["id"],
+                actor_agent_id=agent["id"],
+                mission_id=mission["id"],
+                key="temporary.hold",
+                content="Hold this venue for one hour",
+                provenance="Vendor quote",
+                expires_at=expiry,
+                idempotency_key=self.key(),
+            )["memory"]
+            self.assertEqual(
+                [
+                    memory["id"]
+                    for memory in store.memory_search(
+                        agent_id=agent["id"], query="Hold this venue", mission_id=mission["id"]
+                    )["semantic"]
+                ],
+                [expiring["id"]],
+            )
+            self.clock.advance(hours=2)
+            self.assertEqual(
+                store.memory_search(
+                    agent_id=agent["id"], query="Hold this venue", mission_id=mission["id"]
+                )["semantic"],
+                [],
+            )
+            self.assertEqual(
+                len(
+                    store.semantic_memory_history(
+                        agent_id=agent["id"],
+                        mission_id=mission["id"],
+                        key="temporary.hold",
+                    )
+                ),
+                1,
+            )
+
+    def test_procedural_memory_requires_human_approval(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            change = store.procedural_memory_change_propose(
+                agent_id=agent["id"],
+                proposed_by=agent["id"],
+                mission_id=mission["id"],
+                name="vendor_followup",
+                content="Follow up after two business days",
+                expected_version=0,
+                reason="Observed reliable practice",
+                idempotency_key=self.key(),
+            )["change"]
+            self.assertEqual(
+                store.memory_search(agent_id=agent["id"], query="vendor")["procedural"],
+                [],
+            )
+            decision = store.mission_change_decide(
+                change_id=change["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Useful procedure",
+                idempotency_key=self.key(),
+            )
+            self.assertEqual(decision["change"]["status"], "approved")
+            self.assertEqual(decision["procedure"]["version"], 1)
+            procedures = store.memory_search(agent_id=agent["id"], query="vendor")["procedural"]
+            self.assertEqual(procedures[0]["content"], "Follow up after two business days")
+            self.assert_domain_error(
+                "VERSION_CONFLICT",
+                store.procedural_memory_change_propose,
+                agent_id=agent["id"],
+                proposed_by=agent["id"],
+                mission_id=mission["id"],
+                name="vendor_followup",
+                content="Stale procedure",
+                expected_version=0,
+                reason="Stale proposal",
+                idempotency_key=self.key(),
+            )
+            general_change = store.procedural_memory_change_propose(
+                agent_id=agent["id"],
+                proposed_by=agent["id"],
+                name="briefing_format",
+                content="Lead with decisions and open questions",
+                expected_version=0,
+                reason="Improve general briefings",
+                idempotency_key=self.key(),
+            )["change"]
+            store.mission_change_decide(
+                change_id=general_change["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Useful across missions",
+                idempotency_key=self.key(),
+            )
+            self.assertEqual(
+                store.memory_search(agent_id=agent["id"], query="briefing")["procedural"][0][
+                    "name"
+                ],
+                "briefing_format",
+            )
+
+    def test_outsider_cannot_inject_scoped_memory_or_block_closure(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            outsider = store.agent_onboard(
+                name="Outside agent",
+                role="Unassigned specialist",
+                idempotency_key=self.key(),
+                agent_id="agent-outsider",
+            )["agent"]
+            self.assert_domain_error(
+                "FORBIDDEN",
+                store.semantic_memory_put,
+                agent_id=outsider["id"],
+                actor_agent_id=outsider["id"],
+                mission_id=mission["id"],
+                key="foreign.context",
+                content="Must not attach to this mission",
+                provenance="Out-of-scope attempt",
+                idempotency_key=self.key(),
+            )
+            self.assert_domain_error(
+                "FORBIDDEN",
+                store.episodic_memory_append,
+                agent_id=outsider["id"],
+                actor_agent_id=outsider["id"],
+                mission_id=mission["id"],
+                summary="Must not become a mission episode",
+                idempotency_key=self.key(),
+            )
+            self.assert_domain_error(
+                "FORBIDDEN",
+                store.procedural_memory_change_propose,
+                agent_id=outsider["id"],
+                proposed_by=outsider["id"],
+                mission_id=mission["id"],
+                name="foreign_procedure",
+                content="Must not become a pending change",
+                expected_version=0,
+                reason="Out-of-scope attempt",
+                idempotency_key=self.key(),
+            )
+            self.assert_domain_error(
+                "FORBIDDEN",
+                store.memory_search,
+                agent_id=outsider["id"],
+                mission_id=mission["id"],
+                query="",
+            )
+            self.assertEqual(store.board_snapshot(mission["id"])["pending_changes"], [])
+            closed = store.mission_close(
+                mission_id=mission["id"],
+                owner_agent_id=agent["id"],
+                expected_version=mission["version"],
+                closure_evidence=[{"summary": "No foreign proposal blocked closure"}],
+                idempotency_key=self.key(),
+            )["mission"]
+            self.assertEqual(closed["status"], "closed")
+
+    def test_compaction_retains_every_raw_conversation_message(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            first = store.conversation_append(
+                mission_id=mission["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Find an accessible venue",
+                idempotency_key=self.key(),
+            )["message"]
+            second = store.conversation_append(
+                mission_id=mission["id"],
+                role="assistant",
+                actor_id=agent["id"],
+                content="I will compare three options",
+                idempotency_key=self.key(),
+            )["message"]
+            compacted = store.conversation_compact(
+                mission_id=mission["id"],
+                through_seq=second["seq"],
+                summary="The user requested accessible venue options.",
+                idempotency_key=self.key(),
+            )["compaction"]
+            history = store.conversation_history(mission["id"])
+            self.assertEqual(
+                [message["id"] for message in history],
+                [first["id"], second["id"]],
+            )
+            self.assertEqual(
+                store.mission_handoff(mission["id"])["latest_compaction"]["id"],
+                compacted["id"],
+            )
+            self.assert_domain_error(
+                "VALIDATION_ERROR",
+                store.conversation_compact,
+                mission_id=mission["id"],
+                through_seq=second["seq"],
+                summary="This cursor does not advance",
+                idempotency_key=self.key(),
+            )
+            self.assert_domain_error(
+                "VALIDATION_ERROR",
+                store.conversation_compact,
+                mission_id=mission["id"],
+                through_seq=second["seq"] + 100,
+                summary="This cursor passes retained history",
+                idempotency_key=self.key(),
+            )
+
+    def test_general_agent_conversation_is_retained_and_handed_off(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            message = store.agent_conversation_append(
+                agent_id=agent["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Remember this before we discuss a particular mission.",
+                idempotency_key=self.key(),
+            )["message"]
+            history = store.agent_conversation_history(agent["id"])
+            self.assertEqual([entry["id"] for entry in history], [message["id"]])
+            handoff = store.mission_handoff(mission["id"])
+            self.assertEqual(
+                [entry["id"] for entry in handoff["agent_conversation_tail"]],
+                [message["id"]],
+            )
+
+    def test_delegate_handoff_excludes_owner_private_context(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            delegate = store.agent_onboard(
+                name="Jordan",
+                role="Travel specialist",
+                idempotency_key=self.key(),
+                agent_id="agent-delegate",
+            )["agent"]
+            item = self.create_work(store, agent, mission, "Compare flights")
+            store.work_item_assign(
+                work_item_id=item["id"],
+                owner_agent_id=agent["id"],
+                assignee_agent_id=delegate["id"],
+                expected_version=item["version"],
+                idempotency_key=self.key(),
+            )
+            store.semantic_memory_put(
+                agent_id=agent["id"],
+                actor_agent_id=agent["id"],
+                mission_id=mission["id"],
+                key="owner.private",
+                content="Owner-only memory",
+                provenance="Owner conversation",
+                idempotency_key=self.key(),
+            )
+            store.semantic_memory_put(
+                agent_id=delegate["id"],
+                actor_agent_id=delegate["id"],
+                mission_id=mission["id"],
+                key="delegate.context",
+                content="Delegate memory",
+                provenance="Delegation briefing",
+                idempotency_key=self.key(),
+            )
+            store.agent_conversation_append(
+                agent_id=agent["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Private owner chat",
+                idempotency_key=self.key(),
+            )
+            delegate_message = store.agent_conversation_append(
+                agent_id=delegate["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Delegate briefing",
+                idempotency_key=self.key(),
+            )["message"]
+            store.procedural_memory_change_propose(
+                agent_id=agent["id"],
+                proposed_by=agent["id"],
+                mission_id=mission["id"],
+                name="owner_private_process",
+                content="Owner-only procedure",
+                expected_version=0,
+                reason="Private workflow improvement",
+                idempotency_key=self.key(),
+            )
+
+            handoff = store.mission_handoff(mission["id"], agent_id=delegate["id"])
+            self.assertEqual(handoff["agent"]["id"], delegate["id"])
+            self.assertEqual(handoff["recipient_agent_id"], delegate["id"])
+            self.assertEqual(handoff["mission_owner_agent_id"], agent["id"])
+            self.assertEqual(
+                [memory["key"] for memory in handoff["memory"]["semantic"]],
+                ["delegate.context"],
+            )
+            self.assertEqual(
+                [message["id"] for message in handoff["agent_conversation_tail"]],
+                [delegate_message["id"]],
+            )
+            self.assertNotIn("Owner-only memory", str(handoff))
+            self.assertNotIn("Owner-only procedure", str(handoff))
+            self.assertNotIn("Private owner chat", str(handoff))
+            self.assertEqual(handoff["board"]["hidden_agent_private_pending_change_count"], 1)
+
+    def test_handoff_uses_newest_post_compaction_and_audit_tails(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            first = store.conversation_append(
+                mission_id=mission["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Start the mission",
+                idempotency_key=self.key(),
+            )["message"]
+            store.conversation_compact(
+                mission_id=mission["id"],
+                through_seq=first["seq"],
+                summary="The mission started.",
+                idempotency_key=self.key(),
+            )
+            messages = []
+            for index in range(60):
+                messages.append(
+                    store.conversation_append(
+                        mission_id=mission["id"],
+                        role="assistant",
+                        actor_id=agent["id"],
+                        content=f"Update {index}",
+                        idempotency_key=self.key(),
+                    )["message"]
+                )
+            handoff = store.mission_handoff(mission["id"], conversation_tail=5)
+            self.assertEqual(
+                [message["id"] for message in handoff["conversation_tail"]],
+                [message["id"] for message in messages[-5:]],
+            )
+            self.assertTrue(handoff["conversation_tail_truncated"])
+            self.assertEqual(
+                handoff["audit_tail"][-1]["payload"]["message_id"],
+                messages[-1]["id"],
+            )
+            self.assertTrue(handoff["audit_tail_truncated"])
+
+    def test_human_reply_correlates_only_to_same_mission_needs_input_work(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            item = self.create_work(
+                store,
+                agent,
+                mission,
+                "Choose a venue",
+                state="needs_input",
+                input_request="Which venue do you prefer?",
+            )
+            reply = store.conversation_append(
+                mission_id=mission["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Choose the waterfront venue.",
+                metadata={"work_item_id": item["id"]},
+                idempotency_key=self.key(),
+            )["message"]
+            self.assertEqual(reply["metadata"]["work_item_id"], item["id"])
+
+            other_mission = store.mission_create(
+                owner_agent_id=agent["id"],
+                title="Other conversation",
+                goal="Stay separate",
+                constraints=[],
+                acceptance_criteria=["No cross-scope correlation"],
+                idempotency_key=self.key(),
+            )["mission"]
+            self.assert_domain_error(
+                "OUT_OF_SCOPE",
+                store.conversation_append,
+                mission_id=other_mission["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Wrong mission",
+                metadata={"work_item_id": item["id"]},
+                idempotency_key=self.key(),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

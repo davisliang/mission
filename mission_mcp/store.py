@@ -3,7 +3,7 @@
 This module deliberately contains no MCP transport. It owns the rules that
 must survive model and host changes: atomic writes, request-bound idempotency,
 the five work states, single-writer versions, dependency integrity, evidence,
-and durable execution and wake leases.
+durable execution and wake leases, governed memory, and immutable conversation.
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ JSON_COLUMNS = {
     "payload_json",
     "patch_json",
     "outcome_evidence_json",
+    "evidence_json",
+    "tags_json",
 }
 SECRET_KEY_SUFFIXES = {
     "apikey",
@@ -409,7 +411,10 @@ class MissionStore:
                 );
                 CREATE TABLE IF NOT EXISTS mission_changes (
                   id TEXT PRIMARY KEY,
-                  mission_id TEXT NOT NULL REFERENCES missions(id),
+                  kind TEXT NOT NULL DEFAULT 'mission'
+                    CHECK(kind IN ('mission','procedure')),
+                  mission_id TEXT REFERENCES missions(id),
+                  agent_id TEXT REFERENCES agents(id),
                   proposed_by TEXT NOT NULL REFERENCES agents(id),
                   patch_json TEXT NOT NULL,
                   reason TEXT NOT NULL,
@@ -497,6 +502,77 @@ class MissionStore:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS semantic_memory (
+                  id TEXT PRIMARY KEY,
+                  agent_id TEXT NOT NULL REFERENCES agents(id),
+                  mission_id TEXT REFERENCES missions(id),
+                  key TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  provenance TEXT NOT NULL,
+                  expires_at TEXT,
+                  version INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS semantic_memory_scope
+                  ON semantic_memory(agent_id,IFNULL(mission_id,''),key);
+                CREATE TABLE IF NOT EXISTS semantic_memory_versions (
+                  memory_id TEXT NOT NULL REFERENCES semantic_memory(id),
+                  agent_id TEXT NOT NULL REFERENCES agents(id),
+                  mission_id TEXT REFERENCES missions(id),
+                  key TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  provenance TEXT NOT NULL,
+                  expires_at TEXT,
+                  version INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY(memory_id,version)
+                );
+                CREATE TABLE IF NOT EXISTS episodes (
+                  id TEXT PRIMARY KEY,
+                  agent_id TEXT NOT NULL REFERENCES agents(id),
+                  mission_id TEXT REFERENCES missions(id),
+                  summary TEXT NOT NULL,
+                  evidence_json TEXT NOT NULL,
+                  tags_json TEXT NOT NULL,
+                  occurred_at TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS procedures (
+                  id TEXT PRIMARY KEY,
+                  agent_id TEXT NOT NULL REFERENCES agents(id),
+                  name TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  version INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(agent_id,name)
+                );
+                CREATE TABLE IF NOT EXISTS conversation (
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                  id TEXT UNIQUE NOT NULL,
+                  mission_id TEXT REFERENCES missions(id),
+                  agent_id TEXT NOT NULL REFERENCES agents(id),
+                  role TEXT NOT NULL CHECK(role IN ('user','assistant','tool','system')),
+                  actor_id TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS conversation_mission_seq
+                  ON conversation(mission_id,seq);
+                CREATE INDEX IF NOT EXISTS conversation_agent_seq
+                  ON conversation(agent_id,mission_id,seq);
+                CREATE TABLE IF NOT EXISTS compactions (
+                  id TEXT PRIMARY KEY,
+                  mission_id TEXT NOT NULL REFERENCES missions(id),
+                  agent_id TEXT NOT NULL REFERENCES agents(id),
+                  through_seq INTEGER NOT NULL,
+                  summary TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(mission_id,through_seq)
+                );
                 CREATE TABLE IF NOT EXISTS events (
                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
                   id TEXT UNIQUE NOT NULL,
@@ -521,11 +597,82 @@ class MissionStore:
                 BEFORE DELETE ON events BEGIN
                   SELECT RAISE(ABORT, 'events are append-only');
                 END;
+                CREATE TRIGGER IF NOT EXISTS semantic_versions_no_update
+                BEFORE UPDATE ON semantic_memory_versions BEGIN
+                  SELECT RAISE(ABORT, 'semantic memory versions are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS semantic_versions_no_delete
+                BEFORE DELETE ON semantic_memory_versions BEGIN
+                  SELECT RAISE(ABORT, 'semantic memory versions are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS episodes_no_update
+                BEFORE UPDATE ON episodes BEGIN
+                  SELECT RAISE(ABORT, 'episodes are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS episodes_no_delete
+                BEFORE DELETE ON episodes BEGIN
+                  SELECT RAISE(ABORT, 'episodes are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS conversation_no_update
+                BEFORE UPDATE ON conversation BEGIN
+                  SELECT RAISE(ABORT, 'conversation messages are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS conversation_no_delete
+                BEFORE DELETE ON conversation BEGIN
+                  SELECT RAISE(ABORT, 'conversation messages are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS compactions_no_update
+                BEFORE UPDATE ON compactions BEGIN
+                  SELECT RAISE(ABORT, 'compaction checkpoints are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS compactions_no_delete
+                BEFORE DELETE ON compactions BEGIN
+                  SELECT RAISE(ABORT, 'compaction checkpoints are append-only');
+                END;
                 """
             )
             self._ensure_column("missions", "board_revision", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column("missions", "closed_at", "TEXT")
             self._ensure_column("missions", "closure_evidence_json", "TEXT")
+            mission_change_columns = {
+                row["name"]: row for row in self.db.execute("PRAGMA table_info(mission_changes)")
+            }
+            if mission_change_columns["mission_id"]["notnull"]:
+                has_kind = "kind" in mission_change_columns
+                has_agent_id = "agent_id" in mission_change_columns
+                kind_expression = "kind" if has_kind else "'mission'"
+                agent_expression = "agent_id" if has_agent_id else "proposed_by"
+                with self._transaction():
+                    self.db.execute("ALTER TABLE mission_changes RENAME TO mission_changes_legacy")
+                    self.db.execute(
+                        "CREATE TABLE mission_changes ("
+                        "id TEXT PRIMARY KEY,"
+                        "kind TEXT NOT NULL DEFAULT 'mission' CHECK(kind IN "
+                        "('mission','procedure')),mission_id TEXT REFERENCES missions(id),"
+                        "agent_id TEXT REFERENCES agents(id),"
+                        "proposed_by TEXT NOT NULL REFERENCES agents(id),"
+                        "patch_json TEXT NOT NULL,reason TEXT NOT NULL,"
+                        "expected_mission_version INTEGER NOT NULL,"
+                        "status TEXT NOT NULL DEFAULT 'pending' "
+                        "CHECK(status IN ('pending','approved','rejected')) ,"
+                        "version INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,"
+                        "decided_at TEXT,decided_by TEXT,decision_reason TEXT)"
+                    )
+                    self.db.execute(
+                        "INSERT INTO mission_changes(id,kind,mission_id,agent_id,proposed_by,"
+                        "patch_json,reason,expected_mission_version,status,version,created_at,"
+                        "decided_at,decided_by,decision_reason) SELECT id,"
+                        f"{kind_expression},mission_id,{agent_expression},proposed_by,"
+                        "patch_json,reason,expected_mission_version,status,version,created_at,"
+                        "decided_at,decided_by,decision_reason FROM mission_changes_legacy"
+                    )
+                    self.db.execute("DROP TABLE mission_changes_legacy")
+            self._ensure_column("mission_changes", "kind", "TEXT NOT NULL DEFAULT 'mission'")
+            self._ensure_column("mission_changes", "agent_id", "TEXT REFERENCES agents(id)")
+            self.db.execute(
+                "UPDATE mission_changes SET agent_id=proposed_by "
+                "WHERE kind='mission' AND agent_id IS NULL"
+            )
 
     def agent_onboard(
         self,
@@ -836,11 +983,13 @@ class MissionStore:
 
             record_id, now = self._id(), self._now()
             self.db.execute(
-                "INSERT INTO mission_changes(id,mission_id,proposed_by,patch_json,reason,"
-                "expected_mission_version,created_at) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO mission_changes(id,kind,mission_id,agent_id,proposed_by,"
+                "patch_json,reason,expected_mission_version,created_at) "
+                "VALUES(?,'mission',?,?,?,?,?,?,?)",
                 (
                     record_id,
                     mission_id,
+                    proposed_by,
                     proposed_by,
                     self._json(normalized),
                     reason.strip(),
@@ -901,7 +1050,8 @@ class MissionStore:
             now = self._now()
             superseded_ids: list[str] = []
             mission: dict[str, Any] | None = None
-            if approve:
+            procedure: dict[str, Any] | None = None
+            if approve and change["kind"] == "mission":
                 mission = self._mission_open(change["mission_id"])
                 self._version(mission, change["expected_mission_version"])
                 executing_actions = self.db.execute(
@@ -949,6 +1099,43 @@ class MissionStore:
                     (now, change["mission_id"]),
                 )
                 mission = self.mission_get(change["mission_id"])
+            elif approve:
+                if change["mission_id"] is not None:
+                    self._mission_open(change["mission_id"])
+                patch = change["patch"]
+                current = self._one(
+                    "SELECT * FROM procedures WHERE agent_id=? AND name=?",
+                    (change["agent_id"], patch["name"]),
+                )
+                actual_version = current["version"] if current else 0
+                self._require(
+                    actual_version == change["expected_mission_version"],
+                    "VERSION_CONFLICT",
+                    "Procedure changed before approval",
+                    expected=change["expected_mission_version"],
+                    actual=actual_version,
+                )
+                if current:
+                    self.db.execute(
+                        "UPDATE procedures SET content=?,version=version+1,updated_at=? WHERE id=?",
+                        (patch["content"], now, current["id"]),
+                    )
+                    procedure_id = current["id"]
+                else:
+                    procedure_id = self._id()
+                    self.db.execute(
+                        "INSERT INTO procedures(id,agent_id,name,content,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (
+                            procedure_id,
+                            change["agent_id"],
+                            patch["name"],
+                            patch["content"],
+                            now,
+                            now,
+                        ),
+                    )
+                procedure = self._must("procedures", procedure_id, "Procedure")
 
             status = "approved" if approve else "rejected"
             self.db.execute(
@@ -963,17 +1150,24 @@ class MissionStore:
                 ),
             )
             decided = self._must("mission_changes", change_id, "Mission change")
+            event_scope = "mission" if change["kind"] == "mission" else "procedure"
             event_id = self._event(
-                f"mission.change_{status}",
+                f"{event_scope}.change_{status}",
                 mission_id=change["mission_id"],
                 actor_id=human_actor.strip(),
                 payload={
                     "change": decided,
                     "mission": mission,
+                    "procedure": procedure,
                     "superseded_action_request_ids": superseded_ids,
                 },
             )
-            return {"change": decided, "mission": mission, "event_id": event_id}
+            return {
+                "change": decided,
+                "mission": mission,
+                "procedure": procedure,
+                "event_id": event_id,
+            }
 
         return self._mutate("mission_change_decide", idempotency_key, request, operation)
 
@@ -2569,3 +2763,780 @@ class MissionStore:
             }
 
         return self._mutate("wakeup_resolve", idempotency_key, request, operation)
+
+    # --- Durable memory ---------------------------------------------
+
+    def semantic_memory_put(
+        self,
+        *,
+        agent_id: str,
+        actor_agent_id: str,
+        key: str,
+        content: str,
+        provenance: str,
+        idempotency_key: str,
+        mission_id: str | None = None,
+        expected_version: int = 0,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or replace one fact while retaining every full version."""
+        request = {
+            "agent_id": agent_id,
+            "actor_agent_id": actor_agent_id,
+            "key": key,
+            "content": content,
+            "provenance": provenance,
+            "mission_id": mission_id,
+            "expected_version": expected_version,
+            "expires_at": expires_at,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._must("agents", agent_id, "Agent")
+            self._require(
+                actor_agent_id == agent_id,
+                "FORBIDDEN",
+                "Agents may update only their own semantic memory",
+            )
+            if mission_id is not None:
+                self.mission_get_for_agent(mission_id, agent_id)
+            self._require(
+                isinstance(key, str) and key.strip(),
+                "VALIDATION_ERROR",
+                "Memory key is required",
+            )
+            self._require(
+                isinstance(content, str) and content.strip(),
+                "VALIDATION_ERROR",
+                "Memory content is required",
+            )
+            self._require(
+                isinstance(provenance, str) and provenance.strip(),
+                "VALIDATION_ERROR",
+                "Memory provenance is required",
+            )
+            self._require(
+                isinstance(expected_version, int) and expected_version >= 0,
+                "VALIDATION_ERROR",
+                "expected_version must be a non-negative integer",
+            )
+            normalized_key = key.strip()
+            current = self._one(
+                "SELECT * FROM semantic_memory WHERE agent_id=? AND mission_id IS ? AND key=?",
+                (agent_id, mission_id, normalized_key),
+            )
+            actual_version = current["version"] if current else 0
+            self._require(
+                actual_version == expected_version,
+                "VERSION_CONFLICT",
+                "Semantic memory changed; read it again before writing",
+                expected=expected_version,
+                actual=actual_version,
+            )
+            expiry = self._iso(expires_at, "expires_at") if expires_at else None
+            now = self._now()
+            if current:
+                record_id = current["id"]
+                self.db.execute(
+                    "UPDATE semantic_memory SET content=?,provenance=?,expires_at=?,"
+                    "version=version+1,updated_at=? WHERE id=?",
+                    (content.strip(), provenance.strip(), expiry, now, record_id),
+                )
+            else:
+                record_id = self._id()
+                self.db.execute(
+                    "INSERT INTO semantic_memory(id,agent_id,mission_id,key,content,"
+                    "provenance,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        record_id,
+                        agent_id,
+                        mission_id,
+                        normalized_key,
+                        content.strip(),
+                        provenance.strip(),
+                        expiry,
+                        now,
+                        now,
+                    ),
+                )
+            memory = self._must("semantic_memory", record_id, "Semantic memory")
+            self.db.execute(
+                "INSERT INTO semantic_memory_versions(memory_id,agent_id,mission_id,key,"
+                "content,provenance,expires_at,version,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    memory["id"],
+                    memory["agent_id"],
+                    memory["mission_id"],
+                    memory["key"],
+                    memory["content"],
+                    memory["provenance"],
+                    memory["expires_at"],
+                    memory["version"],
+                    memory["created_at"],
+                    memory["updated_at"],
+                ),
+            )
+            event_id = self._event(
+                "memory.semantic_put",
+                mission_id=mission_id,
+                actor_id=actor_agent_id,
+                payload={"memory": memory},
+            )
+            return {"memory": memory, "event_id": event_id}
+
+        return self._mutate("semantic_memory_put", idempotency_key, request, operation)
+
+    def semantic_memory_history(
+        self,
+        *,
+        agent_id: str,
+        key: str,
+        mission_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read every retained version of one fact in chronological order."""
+        with self._lock:
+            self._must("agents", agent_id, "Agent")
+            if mission_id is not None:
+                self.mission_get_for_agent(mission_id, agent_id)
+            self._require(
+                isinstance(key, str) and key.strip(),
+                "VALIDATION_ERROR",
+                "Memory key is required",
+            )
+            return self._all(
+                "SELECT memory_id AS id,agent_id,mission_id,key,content,provenance,"
+                "expires_at,version,created_at,updated_at FROM semantic_memory_versions "
+                "WHERE agent_id=? AND mission_id IS ? AND key=? ORDER BY version",
+                (agent_id, mission_id, key.strip()),
+            )
+
+    def episodic_memory_append(
+        self,
+        *,
+        agent_id: str,
+        actor_agent_id: str,
+        summary: str,
+        idempotency_key: str,
+        mission_id: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
+        tags: list[str] | None = None,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one immutable episode to an agent's history."""
+        request = {
+            "agent_id": agent_id,
+            "actor_agent_id": actor_agent_id,
+            "summary": summary,
+            "mission_id": mission_id,
+            "evidence": evidence,
+            "tags": tags,
+            "occurred_at": occurred_at,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._must("agents", agent_id, "Agent")
+            self._require(
+                actor_agent_id == agent_id,
+                "FORBIDDEN",
+                "Agents may append only their own episodes",
+            )
+            if mission_id is not None:
+                self.mission_get_for_agent(mission_id, agent_id)
+            self._require(
+                isinstance(summary, str) and summary.strip(),
+                "VALIDATION_ERROR",
+                "Episode summary is required",
+            )
+            evidence_values = [] if evidence is None else evidence
+            self._require(
+                isinstance(evidence_values, list),
+                "VALIDATION_ERROR",
+                "Episode evidence must be a list",
+            )
+            if evidence_values:
+                self._validate_evidence(evidence_values, "episode")
+            tag_values = self._string_list([] if tags is None else tags, "tags", allow_empty=True)
+            when = self._iso(occurred_at, "occurred_at") if occurred_at else self._now()
+            record_id, now = self._id(), self._now()
+            self.db.execute(
+                "INSERT INTO episodes(id,agent_id,mission_id,summary,evidence_json,tags_json,"
+                "occurred_at,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    record_id,
+                    agent_id,
+                    mission_id,
+                    summary.strip(),
+                    self._json(evidence_values),
+                    self._json(tag_values),
+                    when,
+                    now,
+                ),
+            )
+            episode = self._must("episodes", record_id, "Episode")
+            event_id = self._event(
+                "memory.episode_appended",
+                mission_id=mission_id,
+                actor_id=actor_agent_id,
+                payload={"episode": episode},
+            )
+            return {"episode": episode, "event_id": event_id}
+
+        return self._mutate("episodic_memory_append", idempotency_key, request, operation)
+
+    def procedural_memory_change_propose(
+        self,
+        *,
+        agent_id: str,
+        proposed_by: str,
+        name: str,
+        content: str,
+        expected_version: int,
+        reason: str,
+        idempotency_key: str,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Propose an agent procedure for trusted-human approval."""
+        request = {
+            "agent_id": agent_id,
+            "proposed_by": proposed_by,
+            "mission_id": mission_id,
+            "name": name,
+            "content": content,
+            "expected_version": expected_version,
+            "reason": reason,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._must("agents", agent_id, "Agent")
+            self._require(
+                proposed_by == agent_id,
+                "FORBIDDEN",
+                "Agents may propose only their own procedures",
+            )
+            if mission_id is not None:
+                self.mission_get_for_agent(mission_id, agent_id)
+                self._mission_open(mission_id)
+            self._require(
+                isinstance(name, str) and name.strip(),
+                "VALIDATION_ERROR",
+                "Procedure name is required",
+            )
+            self._require(
+                isinstance(content, str) and content.strip(),
+                "VALIDATION_ERROR",
+                "Procedure content is required",
+            )
+            self._require(
+                isinstance(reason, str) and reason.strip(),
+                "VALIDATION_ERROR",
+                "A proposal reason is required",
+            )
+            self._require(
+                isinstance(expected_version, int) and expected_version >= 0,
+                "VALIDATION_ERROR",
+                "expected_version must be a non-negative integer",
+            )
+            normalized_name = name.strip()
+            current = self._one(
+                "SELECT * FROM procedures WHERE agent_id=? AND name=?",
+                (agent_id, normalized_name),
+            )
+            actual_version = current["version"] if current else 0
+            self._require(
+                actual_version == expected_version,
+                "VERSION_CONFLICT",
+                "Procedure changed; read it again before proposing",
+                expected=expected_version,
+                actual=actual_version,
+            )
+            record_id, now = self._id(), self._now()
+            patch = {"name": normalized_name, "content": content.strip()}
+            self.db.execute(
+                "INSERT INTO mission_changes(id,kind,mission_id,agent_id,proposed_by,"
+                "patch_json,reason,expected_mission_version,created_at) "
+                "VALUES(?,'procedure',?,?,?,?,?,?,?)",
+                (
+                    record_id,
+                    mission_id,
+                    agent_id,
+                    proposed_by,
+                    self._json(patch),
+                    reason.strip(),
+                    expected_version,
+                    now,
+                ),
+            )
+            change = self._must("mission_changes", record_id, "Procedure change")
+            event_id = self._event(
+                "procedure.change_proposed",
+                mission_id=mission_id,
+                actor_id=proposed_by,
+                payload={"change": change},
+            )
+            return {"change": change, "event_id": event_id}
+
+        return self._mutate("procedural_memory_change_propose", idempotency_key, request, operation)
+
+    def memory_search(
+        self,
+        *,
+        agent_id: str,
+        query: str,
+        mission_id: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Search one agent's current, unexpired memory in an optional mission scope."""
+        with self._lock:
+            self._must("agents", agent_id, "Agent")
+            if mission_id is not None:
+                self.mission_get_for_agent(mission_id, agent_id)
+            self._require(
+                isinstance(query, str),
+                "VALIDATION_ERROR",
+                "query must be a string",
+            )
+            self._require(
+                isinstance(limit, int) and limit > 0,
+                "VALIDATION_ERROR",
+                "limit must be positive",
+            )
+            size, term, now = min(limit, 100), f"%{query}%", self._now()
+            if mission_id is None:
+                scope_sql, scope_values = "", []
+            else:
+                scope_sql, scope_values = "AND (mission_id IS NULL OR mission_id=?)", [mission_id]
+            semantic = self._all(
+                "SELECT * FROM semantic_memory WHERE agent_id=? "
+                f"{scope_sql} AND (expires_at IS NULL OR "
+                "julianday(expires_at)>julianday(?)) AND (key LIKE ? OR content LIKE ? "
+                "OR provenance LIKE ?) ORDER BY updated_at DESC,id LIMIT ?",
+                [agent_id, *scope_values, now, term, term, term, size],
+            )
+            episodes = self._all(
+                "SELECT * FROM episodes WHERE agent_id=? "
+                f"{scope_sql} AND (summary LIKE ? OR evidence_json LIKE ? OR tags_json LIKE ?) "
+                "ORDER BY occurred_at DESC,id LIMIT ?",
+                [agent_id, *scope_values, term, term, term, size],
+            )
+            procedures = self._all(
+                "SELECT * FROM procedures WHERE agent_id=? "
+                "AND (name LIKE ? OR content LIKE ?) ORDER BY updated_at DESC,id LIMIT ?",
+                (agent_id, term, term, size),
+            )
+            return {
+                "semantic": semantic,
+                "episodic": episodes,
+                "procedural": procedures,
+            }
+
+    # --- Raw conversation and handoff context ----------------------
+
+    def conversation_append(
+        self,
+        *,
+        mission_id: str,
+        role: str,
+        actor_id: str,
+        content: str,
+        idempotency_key: str,
+        metadata: dict[str, Any] | None = None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append an immutable message to shared mission conversation."""
+        request = {
+            "mission_id": mission_id,
+            "role": role,
+            "actor_id": actor_id,
+            "content": content,
+            "metadata": metadata,
+            "agent_id": agent_id,
+        }
+
+        def operation() -> dict[str, Any]:
+            mission = self._must("missions", mission_id, "Mission")
+            recipient_agent_id = agent_id or mission["owner_agent_id"]
+            self.mission_get_for_agent(mission_id, recipient_agent_id)
+            actor_agent = self._one("SELECT * FROM agents WHERE id=?", (actor_id,))
+            self._require(
+                role != "assistant" or actor_agent,
+                "FORBIDDEN",
+                "Assistant messages require a durable agent identity",
+            )
+            if actor_agent:
+                self.mission_get_for_agent(mission_id, actor_id)
+            message_metadata = {} if metadata is None else metadata
+            self._require(
+                isinstance(message_metadata, dict),
+                "VALIDATION_ERROR",
+                "Conversation metadata must be an object",
+            )
+            correlated_id = message_metadata.get("work_item_id")
+            if correlated_id is not None:
+                item = self._must("work_items", str(correlated_id), "Correlated work item")
+                self._require(
+                    item["mission_id"] == mission_id,
+                    "OUT_OF_SCOPE",
+                    "Correlated work item must belong to this conversation's mission",
+                )
+                self._require(
+                    item["state"] == "needs_input" and not item["archived"],
+                    "INVALID_STATE",
+                    "Replies may correlate only to active needs_input work",
+                )
+                self._require(
+                    role == "user",
+                    "INVALID_STATE",
+                    "A correlated needs_input reply must have the user role",
+                )
+            return self._conversation_insert(
+                agent_id=recipient_agent_id,
+                mission_id=mission_id,
+                role=role,
+                actor_id=actor_id,
+                content=content,
+                metadata=message_metadata,
+            )
+
+        return self._mutate("conversation_append", idempotency_key, request, operation)
+
+    def agent_conversation_append(
+        self,
+        *,
+        agent_id: str,
+        role: str,
+        actor_id: str,
+        content: str,
+        idempotency_key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append raw conversation that is not yet attached to a mission."""
+        request = {
+            "agent_id": agent_id,
+            "role": role,
+            "actor_id": actor_id,
+            "content": content,
+            "metadata": metadata,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._must("agents", agent_id, "Agent")
+            actor_agent = self._one("SELECT * FROM agents WHERE id=?", (actor_id,))
+            self._require(
+                not actor_agent or actor_id == agent_id,
+                "FORBIDDEN",
+                "An agent may append only to its own general conversation",
+            )
+            self._require(
+                role != "assistant" or actor_id == agent_id,
+                "FORBIDDEN",
+                "Assistant messages require the scoped durable agent identity",
+            )
+            message_metadata = {} if metadata is None else metadata
+            self._require(
+                isinstance(message_metadata, dict),
+                "VALIDATION_ERROR",
+                "Conversation metadata must be an object",
+            )
+            self._require(
+                "work_item_id" not in message_metadata,
+                "OUT_OF_SCOPE",
+                "General conversation cannot reference mission work",
+            )
+            return self._conversation_insert(
+                agent_id=agent_id,
+                mission_id=None,
+                role=role,
+                actor_id=actor_id,
+                content=content,
+                metadata=message_metadata,
+            )
+
+        return self._mutate("agent_conversation_append", idempotency_key, request, operation)
+
+    def _conversation_insert(
+        self,
+        *,
+        agent_id: str,
+        mission_id: str | None,
+        role: str,
+        actor_id: str,
+        content: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._require(
+            role in {"user", "assistant", "tool", "system"},
+            "VALIDATION_ERROR",
+            "Invalid conversation role",
+        )
+        self._require(
+            isinstance(actor_id, str) and actor_id.strip(),
+            "VALIDATION_ERROR",
+            "actor_id is required",
+        )
+        self._require(
+            isinstance(content, str) and content.strip(),
+            "VALIDATION_ERROR",
+            "Conversation content is required",
+        )
+        record_id, now = self._id(), self._now()
+        cursor = self.db.execute(
+            "INSERT INTO conversation(id,mission_id,agent_id,role,actor_id,content,"
+            "metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                record_id,
+                mission_id,
+                agent_id,
+                role,
+                actor_id.strip(),
+                content,
+                self._json(metadata),
+                now,
+            ),
+        ).lastrowid
+        message = self._one("SELECT * FROM conversation WHERE id=?", (record_id,))
+        event_id = self._event(
+            "conversation.appended",
+            mission_id=mission_id,
+            actor_id=actor_id.strip(),
+            payload={
+                "message_id": record_id,
+                "seq": cursor,
+                "agent_id": agent_id,
+                "work_item_id": metadata.get("work_item_id"),
+            },
+        )
+        return {"message": message, "event_id": event_id}
+
+    def conversation_history(
+        self,
+        mission_id: str,
+        *,
+        agent_id: str | None = None,
+        after_seq: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read raw mission messages; compaction never removes them."""
+        with self._lock:
+            mission = self._must("missions", mission_id, "Mission")
+            self.mission_get_for_agent(mission_id, agent_id or mission["owner_agent_id"])
+            self._require(
+                isinstance(after_seq, int) and after_seq >= 0,
+                "VALIDATION_ERROR",
+                "after_seq must be a non-negative integer",
+            )
+            self._require(
+                isinstance(limit, int) and limit > 0,
+                "VALIDATION_ERROR",
+                "limit must be positive",
+            )
+            return self._all(
+                "SELECT * FROM conversation WHERE mission_id=? AND seq>? ORDER BY seq LIMIT ?",
+                (mission_id, after_seq, min(limit, 500)),
+            )
+
+    def agent_conversation_history(
+        self,
+        agent_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read raw non-mission conversation for exactly one durable agent."""
+        with self._lock:
+            self._must("agents", agent_id, "Agent")
+            self._require(
+                isinstance(after_seq, int) and after_seq >= 0,
+                "VALIDATION_ERROR",
+                "after_seq must be a non-negative integer",
+            )
+            self._require(
+                isinstance(limit, int) and limit > 0,
+                "VALIDATION_ERROR",
+                "limit must be positive",
+            )
+            return self._all(
+                "SELECT * FROM conversation WHERE agent_id=? AND mission_id IS NULL "
+                "AND seq>? ORDER BY seq LIMIT ?",
+                (agent_id, after_seq, min(limit, 500)),
+            )
+
+    def conversation_compact(
+        self,
+        *,
+        mission_id: str,
+        through_seq: int,
+        summary: str,
+        idempotency_key: str,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Add a monotonic summary checkpoint without deleting raw messages."""
+        request = {
+            "mission_id": mission_id,
+            "through_seq": through_seq,
+            "summary": summary,
+            "agent_id": agent_id,
+        }
+
+        def operation() -> dict[str, Any]:
+            mission = self._must("missions", mission_id, "Mission")
+            checkpoint_agent_id = agent_id or mission["owner_agent_id"]
+            self.mission_get_for_agent(mission_id, checkpoint_agent_id)
+            self._require(
+                isinstance(through_seq, int) and through_seq > 0,
+                "VALIDATION_ERROR",
+                "through_seq must be a positive integer",
+            )
+            self._require(
+                isinstance(summary, str) and summary.strip(),
+                "VALIDATION_ERROR",
+                "Compaction summary is required",
+            )
+            latest_message_seq = self.db.execute(
+                "SELECT COALESCE(MAX(seq),0) FROM conversation WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()[0]
+            previous_seq = self.db.execute(
+                "SELECT COALESCE(MAX(through_seq),0) FROM compactions WHERE mission_id=?",
+                (mission_id,),
+            ).fetchone()[0]
+            self._require(
+                previous_seq < through_seq <= latest_message_seq,
+                "VALIDATION_ERROR",
+                "Compaction cursor must advance and cannot pass the latest message",
+                previous_through_seq=previous_seq,
+                latest_message_seq=latest_message_seq,
+            )
+            new_message_count = self.db.execute(
+                "SELECT COUNT(*) FROM conversation WHERE mission_id=? AND seq>? AND seq<=?",
+                (mission_id, previous_seq, through_seq),
+            ).fetchone()[0]
+            self._require(
+                new_message_count,
+                "VALIDATION_ERROR",
+                "Compaction range contains no new mission messages",
+            )
+            record_id, now = self._id(), self._now()
+            self.db.execute(
+                "INSERT INTO compactions(id,mission_id,agent_id,through_seq,summary,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    record_id,
+                    mission_id,
+                    checkpoint_agent_id,
+                    through_seq,
+                    summary.strip(),
+                    now,
+                ),
+            )
+            checkpoint = self._must("compactions", record_id, "Compaction")
+            event_id = self._event(
+                "conversation.compacted",
+                mission_id=mission_id,
+                actor_id=checkpoint_agent_id,
+                payload={"compaction": checkpoint},
+            )
+            return {"compaction": checkpoint, "event_id": event_id}
+
+        return self._mutate("conversation_compact", idempotency_key, request, operation)
+
+    @staticmethod
+    def _handoff_event_visible(event: dict[str, Any], recipient_agent_id: str) -> bool:
+        """Keep agent-private memory snapshots out of another agent's handoff."""
+        payload = event["payload"]
+        if event["type"] == "memory.semantic_put":
+            return payload["memory"]["agent_id"] == recipient_agent_id
+        if event["type"] == "memory.episode_appended":
+            return payload["episode"]["agent_id"] == recipient_agent_id
+        if event["type"].startswith("procedure."):
+            change = payload.get("change")
+            if change is not None:
+                return change["agent_id"] == recipient_agent_id
+        return True
+
+    def mission_handoff(
+        self,
+        mission_id: str,
+        *,
+        agent_id: str | None = None,
+        conversation_tail: int = 50,
+    ) -> dict[str, Any]:
+        """Build bounded resumption context for one participating recipient agent."""
+        with self._lock:
+            mission = self._must("missions", mission_id, "Mission")
+            recipient_agent_id = agent_id or mission["owner_agent_id"]
+            mission = self.mission_get_for_agent(mission_id, recipient_agent_id)
+            self._require(
+                isinstance(conversation_tail, int) and conversation_tail > 0,
+                "VALIDATION_ERROR",
+                "conversation_tail must be positive",
+            )
+            latest_compaction = self._one(
+                "SELECT * FROM compactions WHERE mission_id=? "
+                "ORDER BY through_seq DESC,id DESC LIMIT 1",
+                (mission_id,),
+            )
+            tail_after = latest_compaction["through_seq"] if latest_compaction else 0
+            tail_size = min(conversation_tail, 500)
+            conversation_count = self.db.execute(
+                "SELECT COUNT(*) FROM conversation WHERE mission_id=? AND seq>?",
+                (mission_id, tail_after),
+            ).fetchone()[0]
+            conversation_rows = list(
+                reversed(
+                    self._all(
+                        "SELECT * FROM conversation WHERE mission_id=? AND seq>? "
+                        "ORDER BY seq DESC LIMIT ?",
+                        (mission_id, tail_after, tail_size),
+                    )
+                )
+            )
+            general_count = self.db.execute(
+                "SELECT COUNT(*) FROM conversation WHERE agent_id=? AND mission_id IS NULL",
+                (recipient_agent_id,),
+            ).fetchone()[0]
+            general_rows = list(
+                reversed(
+                    self._all(
+                        "SELECT * FROM conversation WHERE agent_id=? AND mission_id IS NULL "
+                        "ORDER BY seq DESC LIMIT 20",
+                        (recipient_agent_id,),
+                    )
+                )
+            )
+            visible_events = [
+                event
+                for event in self._all(
+                    "SELECT * FROM events WHERE mission_id=? ORDER BY seq", (mission_id,)
+                )
+                if self._handoff_event_visible(event, recipient_agent_id)
+            ]
+            audit_rows = visible_events[-50:]
+            board = self.board_snapshot(mission_id)
+            private_changes = [
+                change
+                for change in board["pending_changes"]
+                if change["kind"] == "procedure" and change["agent_id"] != recipient_agent_id
+            ]
+            board["pending_changes"] = [
+                change for change in board["pending_changes"] if change not in private_changes
+            ]
+            board["hidden_agent_private_pending_change_count"] = len(private_changes)
+            return {
+                "agent": self.agent_get(recipient_agent_id),
+                "recipient_agent_id": recipient_agent_id,
+                "mission_owner_agent_id": mission["owner_agent_id"],
+                "board": board,
+                "memory": self.memory_search(
+                    agent_id=recipient_agent_id,
+                    query="",
+                    mission_id=mission_id,
+                ),
+                "latest_compaction": latest_compaction,
+                "agent_conversation_tail": general_rows,
+                "agent_conversation_tail_truncated": general_count > len(general_rows),
+                "conversation_tail": conversation_rows,
+                "conversation_tail_truncated": conversation_count > len(conversation_rows),
+                "audit_tail": audit_rows,
+                "audit_tail_truncated": len(visible_events) > len(audit_rows),
+            }

@@ -1,8 +1,9 @@
-# Mission MCP: durable board, governance, and action foundation
+# Mission MCP: durable mission, memory, and handoff foundation
 
 Long-running assistant work should not disappear when a chat ends or a model changes. This
-snapshot keeps the durable agent, mission, and work board in SQLite so another model execution can
-resume the same plan. Current board rows drive execution; append-only events retain what changed.
+snapshot keeps the durable agent, mission, work board, memory, and raw conversation in SQLite so
+another model execution can resume the same plan. Current rows drive execution; immutable history
+retains what changed and why.
 
 ## Included in this snapshot
 
@@ -13,12 +14,15 @@ resume the same plan. Current board rows drive execution; append-only events ret
 - Reasoned archiving that preserves history and protects active dependents
 - Durable leases for actionable work and timed or conditional wakeups
 - Human-approved changes to mission goals, constraints, criteria, and policy
-- Policy-gated, exact-payload permits for one-time external actions
+- Policy-gated, exact-payload execution claims for external actions
+- Versioned semantic facts, immutable episodes, and human-approved procedures
+- Raw mission and general-agent conversation with non-destructive compaction checkpoints
+- Bounded, recipient-scoped handoff context for model-independent resumption
 - Atomic transactions, optimistic versions, and request-bound idempotency
-- An append-only audit trail for board, governance, and action decisions
+- An append-only audit trail for board, governance, action, memory, and conversation events
 
 This remains a transport-independent domain store. It does **not** yet include an MCP server,
-conversation or memory management, procedural memory, external connectors, or a model host.
+external connectors, embeddings or semantic ranking, or a model host.
 
 ## Mission and board model
 
@@ -45,7 +49,7 @@ Archiving is cancellation from the active plan, not a sixth state. It requires a
 deletes the card, and is rejected while another active card depends on it. The owner explicitly
 closes a mission only after every non-archived card is `done`, no wakeup remains live, and the
 overall goal and acceptance criteria have concrete closure evidence. Pending mission changes and
-unredeemed pending or approved actions must also be resolved first.
+pending, approved, or executing actions must also be resolved first.
 
 Every mutation also requires an `idempotency_key`. Repeating the exact request returns the original
 response; reusing that key for different arguments raises `IDEMPOTENCY_CONFLICT`.
@@ -75,6 +79,28 @@ resolved, superseded, or closed action can never replay its payload. Preparing o
 never executes a connector itself. `board_snapshot` exposes pending mission changes and live action
 requests alongside operational work.
 
+## Memory, conversation, and handoff
+
+Semantic memory keeps one current fact per agent, optional mission scope, and key. Writes require
+provenance and an optimistic version; every complete version remains in immutable history and the
+audit stream. Expiry hides a current fact from search without erasing its history. Episodic memory
+is append-only evidence of what happened. Agent-wide procedures do not change immediately: an
+agent proposes an exact versioned change, optionally linked to a mission, and a trusted human
+approves or rejects it through the same governance path as mission changes.
+
+Conversation has two explicit scopes. Mission conversation is shared by participating agents;
+general conversation belongs to one durable agent. Every message is immutable. A compaction is an
+additive summary checkpoint through a validated message cursor, never deletion or replacement of
+the raw history. A user reply may carry `metadata.work_item_id` only for active `needs_input` work
+in the same mission.
+
+`mission_handoff` builds bounded resumption context for a named participating recipient. It keeps
+the recipient identity distinct from the mission owner and combines the authoritative board,
+recipient-only memory and general chat, the newest shared conversation after the latest compaction,
+and the newest shared audit events. Tail truncation flags tell the host when it must page history.
+Another agent's private semantic memory and general chat are never included in the recipient's
+handoff.
+
 ## Host scheduling boundary
 
 SQLite can preserve durable scheduling intent, but it cannot start a model or keep a worker
@@ -82,7 +108,7 @@ process alive. A host or scheduler should:
 
 1. Call `ready_work_claim` to lease `doing` cards and resume their assigned agents.
 2. Call `wakeup_claim_due` to lease due `waiting` checks.
-3. Start the model with the authoritative mission and `board_snapshot` state.
+3. Start the model with the recipient-scoped `mission_handoff` context.
 4. Release the execution lease after the model turn, or resolve the wake as ready or rescheduled.
 5. Claim an approved action, execute it with its `execution_key`, and record the outcome with
    `action_resolve`.
@@ -135,6 +161,10 @@ ephemeral and is useful only for tests or experiments.
 - Governance: `mission_change_propose`, `mission_change_decide`
 - External actions: `action_prepare`, `action_decide`, `action_cancel`, `action_redeem`,
   `action_resolve`
+- Memory: `semantic_memory_put`, `semantic_memory_history`, `episodic_memory_append`,
+  `procedural_memory_change_propose`, `memory_search`
+- Conversation: mission/general append and history, `conversation_compact`
+- Handoff: `mission_handoff`
 - Work: create, get, list, update, assign, add/remove dependency, transition, and archive
 - Board and audit: `board_snapshot`, `audit_list`
 - Runtime: `ready_work_claim`, `ready_work_release`, `wakeup_claim_due`, `wakeup_resolve`
@@ -143,7 +173,9 @@ ephemeral and is useful only for tests or experiments.
 The store assumes one trusted workspace. Authentication, caller-specific tool surfaces, and tenant
 isolation are outside this snapshot. A host must expose human-decision methods only through an
 authenticated human surface and action claim/resolution only to a trusted connector gateway.
-Account references are identifiers, not credentials; secret-shaped metadata fields are rejected.
+references are identifiers, not credentials; secret-shaped metadata fields are rejected. Hosts
+must bind agent-scoped methods to the authenticated durable agent and pass participant identity for
+mission-scoped conversation access.
 
 ## Checks
 
