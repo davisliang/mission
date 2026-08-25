@@ -1307,6 +1307,11 @@ class MissionStore:
                 "Action execution claim is no longer active for this gateway",
             )
             self._require(
+                action["version"] == expected_version + 1,
+                "LEASE_CONFLICT",
+                "Action execution claim generation was retired",
+            )
+            self._require(
                 self._parse_time(action["execution_lease_expires_at"], "execution_lease_expires_at")
                 > self._parse_time(self._now(), "clock"),
                 "LEASE_CONFLICT",

@@ -860,6 +860,61 @@ class MissionStoreTest(unittest.TestCase):
                 idempotency_key=redeem_key,
             )
 
+    def test_action_replay_is_bound_to_one_lease_generation(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            action = store.action_prepare(
+                mission_id=mission["id"],
+                agent_id=agent["id"],
+                action_type="email.send",
+                payload={"to": "guest@example.com"},
+                idempotency_key=self.key(),
+            )["action_request"]
+            first_key = self.key()
+            store.action_redeem(
+                action_request_id=action["id"],
+                gateway_id="gateway:a",
+                expected_version=action["version"],
+                lease_seconds=1,
+                idempotency_key=first_key,
+            )
+            self.clock.advance(seconds=2)
+            second = store.action_redeem(
+                action_request_id=action["id"],
+                gateway_id="gateway:b",
+                expected_version=action["version"] + 1,
+                lease_seconds=1,
+                idempotency_key=self.key(),
+            )
+            self.clock.advance(seconds=2)
+            current_key = self.key()
+            current = store.action_redeem(
+                action_request_id=action["id"],
+                gateway_id="gateway:a",
+                expected_version=second["action_request"]["version"],
+                lease_seconds=60,
+                idempotency_key=current_key,
+            )
+            self.assertEqual(
+                store.action_redeem(
+                    action_request_id=action["id"],
+                    gateway_id="gateway:a",
+                    expected_version=second["action_request"]["version"],
+                    lease_seconds=60,
+                    idempotency_key=current_key,
+                ),
+                current,
+            )
+            self.assert_domain_error(
+                "LEASE_CONFLICT",
+                store.action_redeem,
+                action_request_id=action["id"],
+                gateway_id="gateway:a",
+                expected_version=action["version"],
+                lease_seconds=1,
+                idempotency_key=first_key,
+            )
+
     def test_owner_cancels_pending_and_approved_actions_before_closure(self) -> None:
         store, agent, _ = self.context()
         with store:
