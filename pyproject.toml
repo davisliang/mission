@@ -1,10 +1,13 @@
 [project]
 name = "mission-mcp"
 version = "0.1.0"
-description = "Durable mission state for model-independent agents."
+description = "A compact mission-first MCP server for durable agents."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["mcp==2.1.0"]
+
+[project.scripts]
+mission-mcp = "mission_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]

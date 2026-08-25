@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from mcp import Client, StdioServerParameters
+
 from mission_mcp import DomainError, MissionStore
+from mission_mcp.server import build_server
 
 
 class MutableClock:
@@ -1850,6 +1855,418 @@ class MissionStoreTest(unittest.TestCase):
                 ),
                 [],
             )
+
+
+class MCPIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    AGENT_TOOLS = {
+        "agent_get",
+        "mission_list",
+        "mission_get",
+        "mission_change_propose",
+        "mission_close",
+        "action_prepare",
+        "action_cancel",
+        "board_snapshot",
+        "work_item_get",
+        "work_item_list",
+        "work_item_create",
+        "work_item_update",
+        "work_item_assign",
+        "work_item_add_dependency",
+        "work_item_remove_dependency",
+        "work_item_transition",
+        "work_item_archive",
+        "semantic_memory_put",
+        "semantic_memory_history",
+        "episodic_memory_append",
+        "procedural_memory_change_propose",
+        "procedural_memory_change_list_pending",
+        "memory_search",
+        "conversation_history",
+        "conversation_compact",
+        "mission_handoff",
+        "agent_conversation_history",
+    }
+    CONTROL_TOOLS = {
+        "agent_onboard",
+        "agent_list",
+        "account_reference_add",
+        "account_reference_list",
+        "mission_create",
+        "mission_change_decide",
+        "action_decide",
+        "procedural_memory_change_list_pending",
+        "conversation_append",
+        "agent_conversation_append",
+        "audit_list",
+        "agent_conversation_history",
+    }
+    RUNTIME_TOOLS = {
+        "ready_work_claim",
+        "ready_work_release",
+        "wakeup_claim_due",
+        "wakeup_resolve",
+        "action_redeem",
+        "action_resolve",
+    }
+
+    async def tool_names(self, server, *, resource_template_count: int = 0) -> set[str]:
+        async with Client(server, raise_exceptions=True) as client:
+            self.assertEqual(client.protocol_version, "2026-07-28")
+            self.assertEqual(
+                len((await client.list_resource_templates()).resource_templates),
+                resource_template_count,
+            )
+            return {tool.name for tool in (await client.list_tools()).tools}
+
+    async def test_protocol_surfaces_identity_binding_and_resources(self) -> None:
+        store = MissionStore()
+        try:
+            owner = store.agent_onboard(
+                name="Owner",
+                role="Executive assistant",
+                idempotency_key="mcp-owner",
+                agent_id="agent-owner-mcp",
+            )["agent"]
+            delegate = store.agent_onboard(
+                name="Delegate",
+                role="Travel specialist",
+                idempotency_key="mcp-delegate",
+                agent_id="agent-delegate-mcp",
+            )["agent"]
+            outsider = store.agent_onboard(
+                name="Outsider",
+                role="Unrelated assistant",
+                idempotency_key="mcp-outsider",
+                agent_id="agent-outsider-mcp",
+            )["agent"]
+            mission = store.mission_create(
+                owner_agent_id=owner["id"],
+                title="MCP mission",
+                goal="Prove the transport and privacy boundary",
+                constraints=[],
+                acceptance_criteria=["A real tool and resource call succeed"],
+                idempotency_key="mcp-mission",
+            )["mission"]
+            outsider_mission = store.mission_create(
+                owner_agent_id=outsider["id"],
+                title="Private outsider mission",
+                goal="Remain invisible to the delegate",
+                constraints=[],
+                acceptance_criteria=["No cross-mission access"],
+                idempotency_key="mcp-outsider-mission",
+            )["mission"]
+            store.work_item_create(
+                mission_id=mission["id"],
+                actor_agent_id=owner["id"],
+                assignee_agent_id=delegate["id"],
+                title="Delegated work",
+                description="Resume without owner-private context",
+                idempotency_key="mcp-delegated-work",
+            )
+            store.semantic_memory_put(
+                agent_id=owner["id"],
+                actor_agent_id=owner["id"],
+                mission_id=mission["id"],
+                key="owner.private",
+                content="Do not expose this owner-only fact",
+                provenance="Owner chat",
+                idempotency_key="mcp-owner-memory",
+            )
+            for index in range(2):
+                store.semantic_memory_put(
+                    agent_id=delegate["id"],
+                    actor_agent_id=delegate["id"],
+                    mission_id=mission["id"],
+                    key=f"delegate.fact.{index}",
+                    content=f"Delegate fact {index}",
+                    provenance="Delegation briefing",
+                    idempotency_key=f"mcp-delegate-memory-{index}",
+                )
+            store.agent_conversation_append(
+                agent_id=owner["id"],
+                role="user",
+                actor_id="human:davis",
+                content="Do not expose this owner-only chat",
+                idempotency_key="mcp-owner-chat",
+            )
+            store.procedural_memory_change_propose(
+                agent_id=owner["id"],
+                proposed_by=owner["id"],
+                mission_id=mission["id"],
+                name="owner_private_process",
+                content="Do not expose this owner-only procedure",
+                expected_version=0,
+                reason="Owner-only improvement",
+                idempotency_key="mcp-owner-procedure",
+            )
+
+            with self.assertRaises(ValueError):
+                build_server(store)
+            with self.assertRaises(ValueError):
+                build_server(store, "agent", "missing-agent")
+
+            self.assertEqual(
+                await self.tool_names(build_server(store, "control")),
+                self.CONTROL_TOOLS,
+            )
+            self.assertEqual(
+                await self.tool_names(build_server(store, "runtime")),
+                self.RUNTIME_TOOLS,
+            )
+            self.assertEqual(
+                await self.tool_names(build_server(store, "all"), resource_template_count=2),
+                self.AGENT_TOOLS | self.CONTROL_TOOLS | self.RUNTIME_TOOLS,
+            )
+
+            async with Client(build_server(store, "control"), raise_exceptions=True) as control:
+                owner_pending = await control.call_tool(
+                    "procedural_memory_change_list_pending",
+                    {"agent_id": owner["id"], "mission_id": mission["id"]},
+                )
+                self.assertFalse(owner_pending.is_error)
+                self.assertEqual(len(owner_pending.structured_content["result"]), 1)
+                delegated_message = await control.call_tool(
+                    "conversation_append",
+                    {
+                        "mission_id": mission["id"],
+                        "agent_id": delegate["id"],
+                        "role": "assistant",
+                        "actor_id": delegate["id"],
+                        "content": "A scoped delegate update",
+                        "idempotency_key": "mcp-delegate-message",
+                    },
+                )
+                self.assertFalse(delegated_message.is_error)
+
+            async with Client(
+                build_server(store, "agent", owner["id"]), raise_exceptions=True
+            ) as owner_client:
+                compacted = await owner_client.call_tool(
+                    "conversation_compact",
+                    {
+                        "mission_id": mission["id"],
+                        "owner_agent_id": owner["id"],
+                        "through_seq": delegated_message.structured_content["message"]["seq"],
+                        "summary": "The delegate began work.",
+                        "idempotency_key": "mcp-owner-compaction",
+                    },
+                )
+                self.assertFalse(compacted.is_error)
+
+            async with Client(
+                build_server(store, "agent", delegate["id"]), raise_exceptions=True
+            ) as client:
+                self.assertEqual(client.protocol_version, "2026-07-28")
+                self.assertEqual(
+                    {tool.name for tool in (await client.list_tools()).tools},
+                    self.AGENT_TOOLS,
+                )
+                templates = await client.list_resource_templates()
+                self.assertEqual(
+                    {str(template.uri_template) for template in templates.resource_templates},
+                    {
+                        "mission://{mission_id}/board",
+                        "mission://{mission_id}/handoff",
+                    },
+                )
+
+                mission_result = await client.call_tool(
+                    "mission_get", {"mission_id": mission["id"]}
+                )
+                self.assertFalse(mission_result.is_error)
+                self.assertEqual(mission_result.structured_content["id"], mission["id"])
+
+                handoff_result = await client.call_tool(
+                    "mission_handoff",
+                    {"mission_id": mission["id"], "memory_limit": 1},
+                )
+                self.assertFalse(handoff_result.is_error)
+                self.assertEqual(
+                    handoff_result.structured_content["recipient_agent_id"], delegate["id"]
+                )
+                self.assertTrue(handoff_result.structured_content["memory_truncated"])
+                self.assertNotIn("Do not expose this owner-only fact", str(handoff_result))
+                self.assertNotIn("Do not expose this owner-only chat", str(handoff_result))
+                self.assertNotIn("Do not expose this owner-only procedure", str(handoff_result))
+
+                memory_page = await client.call_tool(
+                    "memory_search",
+                    {
+                        "agent_id": delegate["id"],
+                        "mission_id": mission["id"],
+                        "query": "Delegate fact",
+                        "limit": 1,
+                        "offset": 0,
+                    },
+                )
+                self.assertFalse(memory_page.is_error)
+                self.assertEqual(len(memory_page.structured_content["semantic"]), 1)
+                self.assertEqual(
+                    memory_page.structured_content["pagination"]["semantic"]["next_offset"], 1
+                )
+
+                pending = await client.call_tool(
+                    "procedural_memory_change_list_pending",
+                    {"agent_id": delegate["id"], "mission_id": mission["id"]},
+                )
+                self.assertFalse(pending.is_error)
+                self.assertEqual(pending.structured_content["result"], [])
+
+                board_result = await client.call_tool(
+                    "board_snapshot", {"mission_id": mission["id"]}
+                )
+                self.assertFalse(board_result.is_error)
+                self.assertEqual(board_result.structured_content["pending_changes"], [])
+                self.assertNotIn("Do not expose this owner-only procedure", str(board_result))
+
+                resource = await client.read_resource(f"mission://{mission['id']}/handoff")
+                resource_payload = json.loads(resource.contents[0].text)
+                self.assertEqual(resource_payload["recipient_agent_id"], delegate["id"])
+                self.assertNotIn("Do not expose this owner-only fact", str(resource_payload))
+                self.assertNotIn("Do not expose this owner-only chat", str(resource_payload))
+                self.assertNotIn("Do not expose this owner-only procedure", str(resource_payload))
+
+                board_resource = await client.read_resource(f"mission://{mission['id']}/board")
+                board_payload = json.loads(board_resource.contents[0].text)
+                self.assertEqual(board_payload["mission"]["id"], mission["id"])
+                self.assertEqual(board_payload["pending_changes"], [])
+                self.assertNotIn("Do not expose this owner-only procedure", str(board_payload))
+
+                impersonation = await client.call_tool("agent_get", {"agent_id": owner["id"]})
+                self.assertTrue(impersonation.is_error)
+                self.assertIn("FORBIDDEN", impersonation.content[0].text)
+
+                private_pending = await client.call_tool(
+                    "procedural_memory_change_list_pending",
+                    {"agent_id": owner["id"], "mission_id": mission["id"]},
+                )
+                self.assertTrue(private_pending.is_error)
+                self.assertIn("FORBIDDEN", private_pending.content[0].text)
+
+                outsider_access = await client.call_tool(
+                    "mission_get", {"mission_id": outsider_mission["id"]}
+                )
+                self.assertTrue(outsider_access.is_error)
+                self.assertIn("FORBIDDEN", outsider_access.content[0].text)
+
+                with self.assertRaises(Exception) as outsider_resource:
+                    await client.read_resource(f"mission://{outsider_mission['id']}/board")
+                self.assertIn("FORBIDDEN", str(outsider_resource.exception))
+
+                missing = await client.call_tool("mission_get", {"mission_id": "missing"})
+                self.assertTrue(missing.is_error)
+                self.assertIn("NOT_FOUND", missing.content[0].text)
+
+                with self.assertRaises(Exception) as resource_error:
+                    await client.read_resource("mission://missing/board")
+                self.assertIn("NOT_FOUND", str(resource_error.exception))
+        finally:
+            store.close()
+
+    async def test_runtime_action_claim_resolution_and_replay_fence(self) -> None:
+        store = MissionStore()
+        try:
+            agent = store.agent_onboard(
+                name="Action agent",
+                role="Executive assistant",
+                idempotency_key="runtime-agent",
+            )["agent"]
+            mission = store.mission_create(
+                owner_agent_id=agent["id"],
+                title="Send update",
+                goal="Send exactly one approved update",
+                constraints=[],
+                acceptance_criteria=["Connector outcome is retained"],
+                idempotency_key="runtime-mission",
+            )["mission"]
+            action = store.action_prepare(
+                mission_id=mission["id"],
+                agent_id=agent["id"],
+                action_type="email.send",
+                payload={"to": "recipient-id", "subject": "Update"},
+                idempotency_key="runtime-prepare",
+            )["action_request"]
+            claim_arguments = {
+                "action_request_id": action["id"],
+                "gateway_id": "email-gateway",
+                "expected_version": action["version"],
+                "idempotency_key": "runtime-claim",
+                "lease_seconds": 60,
+            }
+
+            async with Client(build_server(store, "runtime"), raise_exceptions=True) as client:
+                claimed = await client.call_tool("action_redeem", claim_arguments)
+                self.assertFalse(claimed.is_error)
+                self.assertEqual(claimed.structured_content["permit"]["id"], action["id"])
+                self.assertEqual(
+                    claimed.structured_content["permit"]["execution_key"], action["id"]
+                )
+                self.assertEqual(
+                    claimed.structured_content["permit"]["payload"],
+                    {"to": "recipient-id", "subject": "Update"},
+                )
+                self.assertTrue(claimed.structured_content["permit"]["lease_expires_at"])
+                self.assertEqual(
+                    claimed.structured_content["action_request"]["status"], "executing"
+                )
+
+                resolved = await client.call_tool(
+                    "action_resolve",
+                    {
+                        "action_request_id": action["id"],
+                        "gateway_id": "email-gateway",
+                        "expected_version": claimed.structured_content["action_request"]["version"],
+                        "success": True,
+                        "outcome_evidence": [{"provider_message_id": "message-123"}],
+                        "idempotency_key": "runtime-resolve",
+                    },
+                )
+                self.assertFalse(resolved.is_error)
+                self.assertEqual(
+                    resolved.structured_content["action_request"]["status"], "completed"
+                )
+                self.assertEqual(
+                    resolved.structured_content["action_request"]["outcome_evidence"],
+                    [{"provider_message_id": "message-123"}],
+                )
+
+                replay = await client.call_tool("action_redeem", claim_arguments)
+                self.assertTrue(replay.is_error)
+                self.assertIn("PRECONDITION_FAILED", replay.content[0].text)
+                self.assertNotIn("recipient-id", str(replay))
+        finally:
+            store.close()
+
+    async def test_installed_stdio_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-m",
+                    "mission_mcp",
+                    "--surface",
+                    "control",
+                    "--db",
+                    str(Path(directory) / "stdio.db"),
+                ],
+            )
+            async with Client(parameters, raise_exceptions=True) as client:
+                self.assertEqual(client.protocol_version, "2026-07-28")
+                self.assertEqual(
+                    {tool.name for tool in (await client.list_tools()).tools},
+                    self.CONTROL_TOOLS,
+                )
+                result = await client.call_tool(
+                    "agent_onboard",
+                    {
+                        "name": "Stdio agent",
+                        "role": "Executive assistant",
+                        "idempotency_key": "stdio-agent",
+                    },
+                )
+                self.assertFalse(result.is_error)
+                self.assertEqual(result.structured_content["agent"]["name"], "Stdio agent")
 
 
 if __name__ == "__main__":
