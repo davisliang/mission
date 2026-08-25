@@ -1,4 +1,4 @@
-# Mission MCP: durable board and runtime foundation
+# Mission MCP: durable board, governance, and action foundation
 
 Long-running assistant work should not disappear when a chat ends or a model changes. This
 snapshot keeps the durable agent, mission, and work board in SQLite so another model execution can
@@ -12,12 +12,13 @@ resume the same plan. Current board rows drive execution; append-only events ret
 - Evidence-backed completion and explicit, evidence-backed mission closure
 - Reasoned archiving that preserves history and protects active dependents
 - Durable leases for actionable work and timed or conditional wakeups
+- Human-approved changes to mission goals, constraints, criteria, and policy
+- Policy-gated, exact-payload permits for one-time external actions
 - Atomic transactions, optimistic versions, and request-bound idempotency
-- Validated action policy inherited from onboarding, ready for a later enforcement layer
+- An append-only audit trail for board, governance, and action decisions
 
 This remains a transport-independent domain store. It does **not** yet include an MCP server,
-conversation or memory management, human approval flows, external-action permits, connectors, or a
-model host.
+conversation or memory management, procedural memory, external connectors, or a model host.
 
 ## Mission and board model
 
@@ -43,10 +44,31 @@ completion evidence remains in the event stream.
 Archiving is cancellation from the active plan, not a sixth state. It requires a reason, never
 deletes the card, and is rejected while another active card depends on it. The owner explicitly
 closes a mission only after every non-archived card is `done`, no wakeup remains live, and the
-overall goal and acceptance criteria have concrete closure evidence.
+overall goal and acceptance criteria have concrete closure evidence. Pending mission changes and
+unredeemed pending or approved actions must also be resolved first.
 
 Every mutation also requires an `idempotency_key`. Repeating the exact request returns the original
 response; reusing that key for different arguments raises `IDEMPOTENCY_CONFLICT`.
+
+## Governance and external actions
+
+Mission title, goal, constraints, acceptance criteria, and action policy cannot be edited directly.
+The owner proposes an exact patch against the current mission version; a trusted human caller then
+approves or rejects it. Approval fails if the mission changed while the proposal was waiting. Any
+approved mission-specification change supersedes every unredeemed pending or approved action
+permit, ensuring old authority cannot survive a changed objective or policy.
+
+Action policy has a default effect and ordered exact-name or glob rules. The first matching rule
+wins. `action_prepare` is owner-only and stores the exact payload, its hash, and the policy hash:
+
+- `allow` creates an approved permit.
+- `require_approval` creates a pending request for a trusted human decision.
+- `deny` records a denied request and creates no usable permit.
+
+The owner may cancel a pending or approved request with a retained reason. A trusted runtime gateway
+can redeem an approved permit exactly once, with optimistic-version and current-policy checks, and
+receives only the exact stored payload. Preparing or redeeming a permit never executes a connector.
+`board_snapshot` exposes pending mission changes and live action requests alongside operational work.
 
 ## Host scheduling boundary
 
@@ -57,6 +79,7 @@ process alive. A host or scheduler should:
 2. Call `wakeup_claim_due` to lease due `waiting` checks.
 3. Start the model with the authoritative mission and `board_snapshot` state.
 4. Release the execution lease after the model turn, or resolve the wake as ready or rescheduled.
+5. Send an approved `action_redeem` payload to the appropriate connector gateway exactly once.
 
 Leases prevent duplicate dispatch while allowing another worker to recover after expiry. This
 store never sends email, watches an inbox, or executes another connector itself.
@@ -103,14 +126,17 @@ ephemeral and is useful only for tests or experiments.
 - Agents: `agent_onboard`, `agent_get`, `agent_list`
 - Account references: `account_reference_add`, `account_reference_list`
 - Missions: `mission_create`, `mission_get`, `mission_list`, participant reads, `mission_close`
+- Governance: `mission_change_propose`, `mission_change_decide`
+- External actions: `action_prepare`, `action_decide`, `action_cancel`, `action_redeem`
 - Work: create, get, list, update, assign, add/remove dependency, transition, and archive
 - Board and audit: `board_snapshot`, `audit_list`
 - Runtime: `ready_work_claim`, `ready_work_release`, `wakeup_claim_due`, `wakeup_resolve`
 - Lifecycle: `close`, plus context-manager support
 
 The store assumes one trusted workspace. Authentication, caller-specific tool surfaces, and tenant
-isolation are outside this snapshot. Account references are identifiers, not credentials;
-secret-shaped metadata fields are rejected.
+isolation are outside this snapshot. A host must expose human-decision methods only through an
+authenticated human surface and `action_redeem` only to a trusted connector gateway. Account
+references are identifiers, not credentials; secret-shaped metadata fields are rejected.
 
 ## Checks
 

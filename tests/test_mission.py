@@ -714,6 +714,255 @@ class MissionStoreTest(unittest.TestCase):
             ]
             self.assertEqual(len(events), 1)
 
+    def test_mission_change_waits_for_human_and_stale_proposal_conflicts(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            first = store.mission_change_propose(
+                mission_id=mission["id"],
+                proposed_by=agent["id"],
+                expected_version=mission["version"],
+                patch={"goal": "Deliver an approved retreat plan"},
+                reason="Approval is now required",
+                idempotency_key=self.key(),
+            )["change"]
+            stale = store.mission_change_propose(
+                mission_id=mission["id"],
+                proposed_by=agent["id"],
+                expected_version=mission["version"],
+                patch={"constraints": ["Stay on budget", "Use accessible venues"]},
+                reason="Accessibility requirement",
+                idempotency_key=self.key(),
+            )["change"]
+            self.assertEqual(store.mission_get(mission["id"])["goal"], mission["goal"])
+            self.assertCountEqual(
+                [change["id"] for change in store.board_snapshot(mission["id"])["pending_changes"]],
+                [first["id"], stale["id"]],
+            )
+
+            approved = store.mission_change_decide(
+                change_id=first["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Approved",
+                idempotency_key=self.key(),
+            )
+            self.assertEqual(approved["change"]["status"], "approved")
+            changed = store.mission_get(mission["id"])
+            self.assertEqual(changed["goal"], "Deliver an approved retreat plan")
+            self.assertEqual(changed["version"], mission["version"] + 1)
+            self.assert_domain_error(
+                "VERSION_CONFLICT",
+                store.mission_change_decide,
+                change_id=stale["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Too late",
+                idempotency_key=self.key(),
+            )
+
+    def test_action_approval_and_one_time_idempotent_redemption(self) -> None:
+        store, agent, _ = self.context()
+        with store:
+            protected = store.mission_create(
+                owner_agent_id=agent["id"],
+                title="Send invitations",
+                goal="Invite attendees",
+                constraints=[],
+                acceptance_criteria=["Invitations sent"],
+                action_policy={
+                    "default": "allow",
+                    "rules": [
+                        {"action": "email.*", "effect": "require_approval"},
+                        {"action": "email.send", "effect": "deny"},
+                    ],
+                },
+                idempotency_key=self.key(),
+            )["mission"]
+            payload = {
+                "to": "guest@example.com",
+                "subject": "Retreat",
+                "body": "Please join",
+            }
+            action = store.action_prepare(
+                mission_id=protected["id"],
+                agent_id=agent["id"],
+                action_type="email.send",
+                payload=payload,
+                idempotency_key=self.key(),
+            )["action_request"]
+            self.assertEqual(
+                (action["effect"], action["status"]),
+                ("require_approval", "pending"),
+            )
+            self.assert_domain_error(
+                "PRECONDITION_FAILED",
+                store.action_redeem,
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=action["version"],
+                idempotency_key=self.key(),
+            )
+
+            approved = store.action_decide(
+                action_request_id=action["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Recipient and message verified",
+                expected_version=action["version"],
+                idempotency_key=self.key(),
+            )["action_request"]
+            redeem_key = self.key()
+            redeemed = store.action_redeem(
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=approved["version"],
+                idempotency_key=redeem_key,
+            )
+            self.assertEqual(redeemed["permit"]["payload"], payload)
+            self.assertEqual(
+                store.action_redeem(
+                    action_request_id=action["id"],
+                    gateway_id="gateway:email",
+                    expected_version=approved["version"],
+                    idempotency_key=redeem_key,
+                ),
+                redeemed,
+            )
+            self.assert_domain_error(
+                "PRECONDITION_FAILED",
+                store.action_redeem,
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=approved["version"] + 1,
+                idempotency_key=self.key(),
+            )
+
+    def test_owner_cancels_pending_and_approved_actions_before_closure(self) -> None:
+        store, agent, _ = self.context()
+        with store:
+            protected = store.mission_create(
+                owner_agent_id=agent["id"],
+                title="Optional invitations",
+                goal="Decide whether to invite additional attendees",
+                constraints=[],
+                acceptance_criteria=["The invitation decision is recorded"],
+                action_policy={"default": "require_approval", "rules": []},
+                idempotency_key=self.key(),
+            )["mission"]
+            pending = store.action_prepare(
+                mission_id=protected["id"],
+                agent_id=agent["id"],
+                action_type="email.send",
+                payload={"to": "first@example.com"},
+                idempotency_key=self.key(),
+            )["action_request"]
+            to_approve = store.action_prepare(
+                mission_id=protected["id"],
+                agent_id=agent["id"],
+                action_type="email.send",
+                payload={"to": "second@example.com"},
+                idempotency_key=self.key(),
+            )["action_request"]
+            approved = store.action_decide(
+                action_request_id=to_approve["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Initially approved",
+                expected_version=to_approve["version"],
+                idempotency_key=self.key(),
+            )["action_request"]
+            self.assert_domain_error(
+                "PRECONDITION_FAILED",
+                store.mission_close,
+                mission_id=protected["id"],
+                owner_agent_id=agent["id"],
+                expected_version=protected["version"],
+                closure_evidence=[{"summary": "Decision verified"}],
+                idempotency_key=self.key(),
+            )
+
+            pending_reason = "The additional invitation is no longer needed"
+            approved_reason = "The attendee list changed before sending"
+            cancelled_pending = store.action_cancel(
+                action_request_id=pending["id"],
+                owner_agent_id=agent["id"],
+                expected_version=pending["version"],
+                reason=pending_reason,
+                idempotency_key=self.key(),
+            )["action_request"]
+            cancelled_approved = store.action_cancel(
+                action_request_id=approved["id"],
+                owner_agent_id=agent["id"],
+                expected_version=approved["version"],
+                reason=approved_reason,
+                idempotency_key=self.key(),
+            )["action_request"]
+            self.assertEqual(cancelled_pending["status"], "cancelled")
+            self.assertEqual(cancelled_pending["decision_reason"], pending_reason)
+            self.assertEqual(cancelled_approved["status"], "cancelled")
+            self.assertEqual(cancelled_approved["decision_reason"], approved_reason)
+            self.assertEqual(store.board_snapshot(protected["id"])["live_actions"], [])
+            closed = store.mission_close(
+                mission_id=protected["id"],
+                owner_agent_id=agent["id"],
+                expected_version=protected["version"],
+                closure_evidence=[{"summary": "Invitation decision verified"}],
+                idempotency_key=self.key(),
+            )["mission"]
+            self.assertEqual(closed["status"], "closed")
+
+    def test_policy_change_supersedes_unredeemed_action_permits(self) -> None:
+        store, agent, mission = self.context()
+        with store:
+            action = store.action_prepare(
+                mission_id=mission["id"],
+                agent_id=agent["id"],
+                action_type="email.send",
+                payload={"to": "guest@example.com", "body": "Hello"},
+                idempotency_key=self.key(),
+            )["action_request"]
+            self.assertEqual(action["status"], "approved")
+            change = store.mission_change_propose(
+                mission_id=mission["id"],
+                proposed_by=agent["id"],
+                expected_version=mission["version"],
+                patch={
+                    "action_policy": {
+                        "default": "allow",
+                        "rules": [{"action": "email.*", "effect": "deny"}],
+                    }
+                },
+                reason="Pause outbound email",
+                idempotency_key=self.key(),
+            )["change"]
+            store.mission_change_decide(
+                change_id=change["id"],
+                human_actor="human:davis",
+                approve=True,
+                decision_reason="Pause approved",
+                idempotency_key=self.key(),
+            )
+            self.assert_domain_error(
+                "VERSION_CONFLICT",
+                store.action_redeem,
+                action_request_id=action["id"],
+                gateway_id="gateway:email",
+                expected_version=action["version"],
+                idempotency_key=self.key(),
+            )
+            approval_events = [
+                event
+                for event in store.audit_list(mission["id"])
+                if event["type"] == "mission.change_approved"
+            ]
+            self.assertIn(
+                action["id"],
+                approval_events[-1]["payload"]["superseded_action_request_ids"],
+            )
+            snapshot = store.board_snapshot(mission["id"])
+            self.assertEqual(snapshot["pending_changes"], [])
+            self.assertEqual(snapshot["live_actions"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

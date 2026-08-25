@@ -13,6 +13,7 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from fnmatch import fnmatchcase
 from hashlib import sha256
 from threading import RLock
 from typing import Any
@@ -30,6 +31,7 @@ JSON_COLUMNS = {
     "closure_evidence_json",
     "verification_evidence_json",
     "payload_json",
+    "patch_json",
 }
 SECRET_KEY_SUFFIXES = {
     "apikey",
@@ -400,6 +402,42 @@ class MissionStore:
                   closed_at TEXT,
                   closure_evidence_json TEXT
                 );
+                CREATE TABLE IF NOT EXISTS mission_changes (
+                  id TEXT PRIMARY KEY,
+                  mission_id TEXT NOT NULL REFERENCES missions(id),
+                  proposed_by TEXT NOT NULL REFERENCES agents(id),
+                  patch_json TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  expected_mission_version INTEGER NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','approved','rejected')),
+                  version INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL,
+                  decided_at TEXT,
+                  decided_by TEXT,
+                  decision_reason TEXT
+                );
+                CREATE TABLE IF NOT EXISTS action_requests (
+                  id TEXT PRIMARY KEY,
+                  mission_id TEXT NOT NULL REFERENCES missions(id),
+                  agent_id TEXT NOT NULL REFERENCES agents(id),
+                  action_type TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  payload_hash TEXT NOT NULL,
+                  policy_hash TEXT NOT NULL,
+                  effect TEXT NOT NULL
+                    CHECK(effect IN ('allow','require_approval','deny')),
+                  status TEXT NOT NULL
+                    CHECK(status IN ('pending','approved','denied','cancelled',
+                      'redeemed','superseded')),
+                  version INTEGER NOT NULL DEFAULT 1,
+                  decided_by TEXT,
+                  decision_reason TEXT,
+                  decided_at TEXT,
+                  redeemed_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS work_items (
                   id TEXT PRIMARY KEY,
                   mission_id TEXT NOT NULL REFERENCES missions(id),
@@ -727,6 +765,198 @@ class MissionStore:
                 (agent_id, agent_id),
             )
 
+    def mission_change_propose(
+        self,
+        *,
+        mission_id: str,
+        proposed_by: str,
+        expected_version: int,
+        patch: dict[str, Any],
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Propose an exact mission-specification patch for human review."""
+        request = {
+            "mission_id": mission_id,
+            "proposed_by": proposed_by,
+            "expected_version": expected_version,
+            "patch": patch,
+            "reason": reason,
+        }
+
+        def operation() -> dict[str, Any]:
+            mission = self._mission_open(mission_id)
+            self._version(mission, expected_version)
+            self._require(
+                mission["owner_agent_id"] == proposed_by,
+                "FORBIDDEN",
+                "Only the owner may propose mission changes",
+            )
+            self._require(
+                isinstance(reason, str) and reason.strip(),
+                "VALIDATION_ERROR",
+                "A proposal reason is required",
+            )
+            allowed = {
+                "title",
+                "goal",
+                "constraints",
+                "acceptance_criteria",
+                "action_policy",
+            }
+            self._require(
+                isinstance(patch, dict) and patch and set(patch) <= allowed,
+                "VALIDATION_ERROR",
+                "Mission patch is empty or contains unsupported fields",
+            )
+            normalized: dict[str, Any] = {}
+            for field, value in patch.items():
+                if field in {"title", "goal"}:
+                    self._require(
+                        isinstance(value, str) and value.strip(),
+                        "VALIDATION_ERROR",
+                        f"{field} must be a non-empty string",
+                    )
+                    normalized[field] = value.strip()
+                elif field == "constraints":
+                    normalized[field] = self._string_list(value, field, allow_empty=True)
+                elif field == "acceptance_criteria":
+                    normalized[field] = self._string_list(value, field, allow_empty=False)
+                else:
+                    normalized[field] = self._validate_policy(value)
+
+            record_id, now = self._id(), self._now()
+            self.db.execute(
+                "INSERT INTO mission_changes(id,mission_id,proposed_by,patch_json,reason,"
+                "expected_mission_version,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    record_id,
+                    mission_id,
+                    proposed_by,
+                    self._json(normalized),
+                    reason.strip(),
+                    expected_version,
+                    now,
+                ),
+            )
+            change = self._must("mission_changes", record_id, "Mission change")
+            event_id = self._event(
+                "mission.change_proposed",
+                mission_id=mission_id,
+                actor_id=proposed_by,
+                payload={"change": change},
+            )
+            return {"change": change, "event_id": event_id}
+
+        return self._mutate("mission_change_propose", idempotency_key, request, operation)
+
+    def mission_change_decide(
+        self,
+        *,
+        change_id: str,
+        human_actor: str,
+        approve: bool,
+        decision_reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Apply or reject a pending patch from a trusted human caller."""
+        request = {
+            "change_id": change_id,
+            "human_actor": human_actor,
+            "approve": approve,
+            "decision_reason": decision_reason,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._require(
+                isinstance(human_actor, str) and human_actor.strip(),
+                "VALIDATION_ERROR",
+                "human_actor is required",
+            )
+            self._require(
+                isinstance(approve, bool),
+                "VALIDATION_ERROR",
+                "approve must be a boolean",
+            )
+            self._require(
+                isinstance(decision_reason, str) and decision_reason.strip(),
+                "VALIDATION_ERROR",
+                "A decision reason is required",
+            )
+            change = self._must("mission_changes", change_id, "Mission change")
+            self._require(
+                change["status"] == "pending",
+                "INVALID_STATE",
+                "Mission change is no longer pending",
+            )
+            now = self._now()
+            superseded_ids: list[str] = []
+            mission: dict[str, Any] | None = None
+            if approve:
+                mission = self._mission_open(change["mission_id"])
+                self._version(mission, change["expected_mission_version"])
+                assignments: list[str] = []
+                values: list[Any] = []
+                columns = {
+                    "title": "title",
+                    "goal": "goal",
+                    "constraints": "constraints_json",
+                    "acceptance_criteria": "acceptance_criteria_json",
+                    "action_policy": "action_policy_json",
+                }
+                for field, column in columns.items():
+                    if field in change["patch"]:
+                        assignments.append(f"{column}=?")
+                        value = change["patch"][field]
+                        values.append(self._json(value) if column.endswith("_json") else value)
+                values.extend((now, change["mission_id"]))
+                self.db.execute(
+                    f"UPDATE missions SET {','.join(assignments)},version=version+1,"
+                    "updated_at=? WHERE id=?",
+                    values,
+                )
+                superseded_ids = [
+                    row["id"]
+                    for row in self.db.execute(
+                        "SELECT id FROM action_requests WHERE mission_id=? "
+                        "AND status IN ('pending','approved') ORDER BY id",
+                        (change["mission_id"],),
+                    )
+                ]
+                self.db.execute(
+                    "UPDATE action_requests SET status='superseded',version=version+1,"
+                    "updated_at=? WHERE mission_id=? AND status IN ('pending','approved')",
+                    (now, change["mission_id"]),
+                )
+                mission = self.mission_get(change["mission_id"])
+
+            status = "approved" if approve else "rejected"
+            self.db.execute(
+                "UPDATE mission_changes SET status=?,version=version+1,decided_at=?,"
+                "decided_by=?,decision_reason=? WHERE id=?",
+                (
+                    status,
+                    now,
+                    human_actor.strip(),
+                    decision_reason.strip(),
+                    change_id,
+                ),
+            )
+            decided = self._must("mission_changes", change_id, "Mission change")
+            event_id = self._event(
+                f"mission.change_{status}",
+                mission_id=change["mission_id"],
+                actor_id=human_actor.strip(),
+                payload={
+                    "change": decided,
+                    "mission": mission,
+                    "superseded_action_request_ids": superseded_ids,
+                },
+            )
+            return {"change": decided, "mission": mission, "event_id": event_id}
+
+        return self._mutate("mission_change_decide", idempotency_key, request, operation)
+
     def mission_close(
         self,
         *,
@@ -767,10 +997,23 @@ class MissionStore:
                 "AND julianday(lease_expires_at)>julianday(?)",
                 (mission_id, self._now()),
             ).fetchone()[0]
+            pending_changes = self.db.execute(
+                "SELECT COUNT(*) FROM mission_changes WHERE mission_id=? AND status='pending'",
+                (mission_id,),
+            ).fetchone()[0]
+            live_actions = self.db.execute(
+                "SELECT COUNT(*) FROM action_requests "
+                "WHERE mission_id=? AND status IN ('pending','approved')",
+                (mission_id,),
+            ).fetchone()[0]
             self._require(
-                not unfinished and not live_wakes and not live_claims,
+                not unfinished
+                and not live_wakes
+                and not live_claims
+                and not pending_changes
+                and not live_actions,
                 "PRECONDITION_FAILED",
-                "Mission still has active work, wakeups, or execution leases",
+                "Mission still has active work, wakeups, execution leases, changes, or actions",
             )
             self._validate_evidence(closure_evidence, "mission closure")
             now = self._now()
@@ -789,6 +1032,287 @@ class MissionStore:
             return {"mission": closed, "event_id": event_id}
 
         return self._mutate("mission_close", idempotency_key, request, operation)
+
+    # --- Approval-aware external action gateway --------------------
+
+    @staticmethod
+    def _policy_effect(policy: dict[str, Any], action_type: str) -> str:
+        """Return the first matching rule's effect, then the policy default."""
+        for rule in policy["rules"]:
+            if fnmatchcase(action_type, rule["action"]):
+                return rule["effect"]
+        return policy["default"]
+
+    def action_prepare(
+        self,
+        *,
+        mission_id: str,
+        agent_id: str,
+        action_type: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Bind policy evaluation to one exact payload without executing it."""
+        request = {
+            "mission_id": mission_id,
+            "agent_id": agent_id,
+            "action_type": action_type,
+            "payload": payload,
+        }
+
+        def operation() -> dict[str, Any]:
+            mission = self._mission_open(mission_id)
+            self._require(
+                mission["owner_agent_id"] == agent_id,
+                "FORBIDDEN",
+                "Only the mission owner may prepare external actions",
+            )
+            self._require(
+                isinstance(action_type, str) and action_type.strip(),
+                "VALIDATION_ERROR",
+                "action_type is required",
+            )
+            self._require(
+                isinstance(payload, dict),
+                "VALIDATION_ERROR",
+                "payload must be an object",
+            )
+            normalized_type = action_type.strip()
+            effect = self._policy_effect(mission["action_policy"], normalized_type)
+            status = {
+                "allow": "approved",
+                "require_approval": "pending",
+                "deny": "denied",
+            }[effect]
+            encoded_payload = self._json(payload)
+            payload_hash = sha256(encoded_payload.encode()).hexdigest()
+            policy_hash = sha256(self._json(mission["action_policy"]).encode()).hexdigest()
+            record_id, now = self._id(), self._now()
+            self.db.execute(
+                "INSERT INTO action_requests(id,mission_id,agent_id,action_type,"
+                "payload_json,payload_hash,policy_hash,effect,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    record_id,
+                    mission_id,
+                    agent_id,
+                    normalized_type,
+                    encoded_payload,
+                    payload_hash,
+                    policy_hash,
+                    effect,
+                    status,
+                    now,
+                    now,
+                ),
+            )
+            action = self._must("action_requests", record_id, "Action request")
+            event_id = self._event(
+                "action.prepared",
+                mission_id=mission_id,
+                actor_id=agent_id,
+                payload={
+                    "action_request_id": record_id,
+                    "action_type": normalized_type,
+                    "payload_hash": payload_hash,
+                    "policy_hash": policy_hash,
+                    "effect": effect,
+                    "status": status,
+                },
+            )
+            return {"action_request": action, "event_id": event_id}
+
+        return self._mutate("action_prepare", idempotency_key, request, operation)
+
+    def action_decide(
+        self,
+        *,
+        action_request_id: str,
+        human_actor: str,
+        approve: bool,
+        decision_reason: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Record a trusted human decision for a pending exact payload."""
+        request = {
+            "action_request_id": action_request_id,
+            "human_actor": human_actor,
+            "approve": approve,
+            "decision_reason": decision_reason,
+            "expected_version": expected_version,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._require(
+                isinstance(human_actor, str) and human_actor.strip(),
+                "VALIDATION_ERROR",
+                "human_actor is required",
+            )
+            self._require(
+                isinstance(approve, bool),
+                "VALIDATION_ERROR",
+                "approve must be a boolean",
+            )
+            self._require(
+                isinstance(decision_reason, str) and decision_reason.strip(),
+                "VALIDATION_ERROR",
+                "A decision reason is required",
+            )
+            action = self._must("action_requests", action_request_id, "Action request")
+            self._mission_open(action["mission_id"])
+            self._version(action, expected_version)
+            self._require(
+                action["status"] == "pending",
+                "INVALID_STATE",
+                "Action is not pending human approval",
+            )
+            status, now = ("approved" if approve else "denied"), self._now()
+            self.db.execute(
+                "UPDATE action_requests SET status=?,version=version+1,decided_by=?,"
+                "decision_reason=?,decided_at=?,updated_at=? WHERE id=?",
+                (
+                    status,
+                    human_actor.strip(),
+                    decision_reason.strip(),
+                    now,
+                    now,
+                    action_request_id,
+                ),
+            )
+            decided = self._must("action_requests", action_request_id, "Action request")
+            event_id = self._event(
+                f"action.{status}",
+                mission_id=action["mission_id"],
+                actor_id=human_actor.strip(),
+                payload={"action_request": decided},
+            )
+            return {"action_request": decided, "event_id": event_id}
+
+        return self._mutate("action_decide", idempotency_key, request, operation)
+
+    def action_cancel(
+        self,
+        *,
+        action_request_id: str,
+        owner_agent_id: str,
+        expected_version: int,
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Abandon an unredeemed action so it cannot strand a mission."""
+        request = {
+            "action_request_id": action_request_id,
+            "owner_agent_id": owner_agent_id,
+            "expected_version": expected_version,
+            "reason": reason,
+        }
+
+        def operation() -> dict[str, Any]:
+            action = self._must("action_requests", action_request_id, "Action request")
+            mission = self._mission_open(action["mission_id"])
+            self._version(action, expected_version)
+            self._require(
+                mission["owner_agent_id"] == owner_agent_id,
+                "FORBIDDEN",
+                "Only the mission owner may cancel an action",
+            )
+            self._require(
+                action["status"] in {"pending", "approved"},
+                "INVALID_STATE",
+                "Only a pending or approved action may be cancelled",
+            )
+            self._require(
+                isinstance(reason, str) and reason.strip(),
+                "VALIDATION_ERROR",
+                "A cancellation reason is required",
+            )
+            now = self._now()
+            self.db.execute(
+                "UPDATE action_requests SET status='cancelled',version=version+1,"
+                "decided_by=?,decision_reason=?,decided_at=?,updated_at=? WHERE id=?",
+                (owner_agent_id, reason.strip(), now, now, action_request_id),
+            )
+            cancelled = self._must("action_requests", action_request_id, "Action request")
+            event_id = self._event(
+                "action.cancelled",
+                mission_id=action["mission_id"],
+                actor_id=owner_agent_id,
+                payload={"action_request": cancelled, "reason": reason.strip()},
+            )
+            return {"action_request": cancelled, "event_id": event_id}
+
+        return self._mutate("action_cancel", idempotency_key, request, operation)
+
+    def action_redeem(
+        self,
+        *,
+        action_request_id: str,
+        gateway_id: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Consume an approved permit once and return its exact stored payload."""
+        request = {
+            "action_request_id": action_request_id,
+            "gateway_id": gateway_id,
+            "expected_version": expected_version,
+        }
+
+        def operation() -> dict[str, Any]:
+            self._require(
+                isinstance(gateway_id, str) and gateway_id.strip(),
+                "VALIDATION_ERROR",
+                "gateway_id is required",
+            )
+            action = self._must("action_requests", action_request_id, "Action request")
+            self._version(action, expected_version)
+            self._require(
+                action["status"] == "approved",
+                "PRECONDITION_FAILED",
+                "Action permit is not approved or was already consumed",
+            )
+            mission = self._mission_open(action["mission_id"])
+            policy_hash = sha256(self._json(mission["action_policy"]).encode()).hexdigest()
+            self._require(
+                action["policy_hash"] == policy_hash,
+                "PRECONDITION_FAILED",
+                "Mission action policy changed; prepare the action again",
+            )
+            self._require(
+                sha256(self._json(action["payload"]).encode()).hexdigest()
+                == action["payload_hash"],
+                "PRECONDITION_FAILED",
+                "Stored action payload no longer matches its permit",
+            )
+            now = self._now()
+            self.db.execute(
+                "UPDATE action_requests SET status='redeemed',version=version+1,"
+                "redeemed_at=?,updated_at=? WHERE id=?",
+                (now, now, action_request_id),
+            )
+            event_id = self._event(
+                "action.redeemed",
+                mission_id=action["mission_id"],
+                actor_id=gateway_id.strip(),
+                payload={
+                    "action_request_id": action_request_id,
+                    "payload_hash": action["payload_hash"],
+                },
+            )
+            return {
+                "permit": {
+                    "id": action_request_id,
+                    "mission_id": action["mission_id"],
+                    "agent_id": action["agent_id"],
+                    "action_type": action["action_type"],
+                    "payload": action["payload"],
+                    "payload_hash": action["payload_hash"],
+                },
+                "event_id": event_id,
+            }
+
+        return self._mutate("action_redeem", idempotency_key, request, operation)
 
     def audit_list(
         self,
@@ -1583,6 +2107,16 @@ class MissionStore:
                 "wakeups": self._all(
                     "SELECT * FROM wakeups WHERE mission_id=? "
                     "AND status IN ('scheduled','claimed') ORDER BY due_at,id",
+                    (mission_id,),
+                ),
+                "pending_changes": self._all(
+                    "SELECT * FROM mission_changes WHERE mission_id=? "
+                    "AND status='pending' ORDER BY created_at,id",
+                    (mission_id,),
+                ),
+                "live_actions": self._all(
+                    "SELECT * FROM action_requests WHERE mission_id=? "
+                    "AND status IN ('pending','approved') ORDER BY created_at,id",
                     (mission_id,),
                 ),
                 "execution_claims": self._all(
